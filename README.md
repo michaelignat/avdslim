@@ -54,10 +54,26 @@ avdslim shutdown MyGolden    # re-seals
 
 Existing clones keep what they had.
 
+## Slim a golden
+
+Smaller golden, lighter clones: 2 GB guest RAM and fewer background apps.
+
+```sh
+avdslim slim MyGolden --ram 2048 --golden   # stopped golden; below 2560 MB it boots with -lowram
+avdslim boot MyGolden --golden --cold
+avdslim slim MyGolden --golden              # disable unused packages (running golden)
+avdslim shutdown MyGolden                   # seal; clones inherit it
+```
+
+- Categories: `apps assistant telephony wallpaper telemetry radios` (default), `gms` (opt-in; may break apps that need Play services).
+- `--except cat,...` skips some. `--with gms` adds gms. `--off` re-enables.
+- `avdslim status` shows `slim:` and the RAM.
+- Measured on API 34 (two samples each): about 0.8 GB less memory per emulator, snapshot 0.5 GB smaller.
+
 ## Safety
 
 - Running emulators can't be cloned or deleted.
-- The golden can't be booted, changed or deleted without `--golden`.
+- The golden can't be booted, changed, slimmed or deleted without `--golden`.
 - `delete` only removes clones that avdslim made.
 
 ## Reference

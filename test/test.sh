@@ -196,6 +196,7 @@ rm "$FAKE/not-ready"
 echo "package:app.ailo" > "$FAKE/packages"; "$AVDSLIM" delete v2 --stop >/dev/null 2>&1
 check "cold boot on request" 0 "$AVDSLIM" clone Base v3; "$AVDSLIM" boot v3 --cold >/dev/null 2>&1
 t "--cold skips the snapshot" has_arg v3 -no-snapshot-load
+t "an old golden (no lowram key) boots without -lowram" eval '! has_arg v3 -lowram'
 "$AVDSLIM" delete v3 --stop >/dev/null 2>&1
 
 # --- a snapshot saved without the host GPU only loads with the emulator's default renderer
@@ -210,6 +211,49 @@ check "cold golden boot switches to the host GPU" 0 "$AVDSLIM" boot Legacy --gol
 t "cold golden boot uses -gpu host" eval 'has_arg Legacy "-gpu host" && has_arg Legacy -no-snapshot-save'
 check "shutdown seals a golden" 0 "$AVDSLIM" shutdown Legacy; contains "sealed Legacy"
 t "re-sealed snapshot records the host GPU" grep -q 'hw.gpu.mode = host' "$ANDROID_AVD_HOME/Legacy.avd/snapshots/default_boot/hardware.ini"
+
+# --- slim: RAM + -lowram, package categories, and what a seal hands to clones
+S="$ANDROID_AVD_HOME/Slimmy.avd"; slim_log() { grep "^Slimmy: shell .* true$" "$FAKE/adb.log" | tail -1; }
+make_avd Slimmy
+check "slim refuses a plain AVD" 3 "$AVDSLIM" slim Slimmy --golden; contains "not a golden"
+"$AVDSLIM" golden Slimmy >/dev/null
+check "slim refuses a golden without --golden" 3 "$AVDSLIM" slim Slimmy
+check "slim needs a running golden" 1 "$AVDSLIM" slim Slimmy --golden; contains "not running"
+check "slim rejects --json" 2 "$AVDSLIM" slim Slimmy --golden --json
+check "slim rejects a bad --ram" 2 "$AVDSLIM" slim Slimmy --golden --ram lots
+check "slim rejects an unknown category" 2 "$AVDSLIM" slim Slimmy --golden --except nope
+check "--ram sets plain MB and marks lowram" 0 "$AVDSLIM" slim Slimmy --golden --ram 2048
+t "config has hw.ramSize=2048" eval 'grep -qx "hw.ramSize=2048" "$S/config.ini" && [ "$(grep -c hw.ramSize "$S/config.ini")" = 1 ]'
+t "golden marker has lowram=1" grep -qx 'lowram=1' "$S/avdslim.golden"
+"$AVDSLIM" boot Slimmy --golden --cold >/dev/null 2>&1
+t "golden cold boot passes -lowram" has_arg Slimmy -lowram
+check "--ram refused while running" 3 "$AVDSLIM" slim Slimmy --golden --ram 3072
+check "slim a running golden" 0 "$AVDSLIM" slim Slimmy --golden; contains "slim=apps,assistant,telephony,wallpaper,telemetry,radios"
+t "guest disabled packages" eval 'slim_log | grep -q "com.google.android.youtube.*pm disable-user --user 0"'
+t "guest disabled radios" eval 'slim_log | grep -q "svc bluetooth disable.*ble_scan_always_enabled 0.*wifi_scan_always_enabled 0"'
+t "gms is opt-in" eval '! slim_log | grep -q com.google.android.gms'
+check "--with gms adds it" 0 "$AVDSLIM" slim Slimmy --golden --with gms; contains "radios,gms"
+t "gms disabled when asked" eval 'slim_log | grep -q "com.google.android.gms.*pm disable-user"'
+check "--off --except undoes all but apps" 0 "$AVDSLIM" slim Slimmy --golden --off --except apps,gms; contains "slim=apps,gms"
+t "--off re-enables" eval 'slim_log | grep -q "pm enable --user 0" && slim_log | grep -q "svc bluetooth enable"'
+t "--except skips a category" eval '! slim_log | grep -q com.google.android.youtube'
+check "--off everything empties the record" 0 "$AVDSLIM" slim Slimmy --golden --off --with gms; contains "slim=(none)"
+t "empty record drops the key" eval '! grep -q "^slim=" "$S/avdslim.golden"'
+check "--except takes a comma list" 0 "$AVDSLIM" slim Slimmy --golden --except radios,wallpaper,telemetry,telephony,assistant; contains "slim=apps"
+t "never-list packages are absent" eval '! sed -n "/^slim_pkgs/,/^}/p" "$AVDSLIM" | grep -qE "\.phone |webview|inputmethod|nexuslauncher|permissioncontroller|providers\.media\.module|documentsui|networkstack|packageinstaller|devicelockcontroller"'
+check "seal keeps lowram and slim" 0 "$AVDSLIM" shutdown Slimmy; contains "sealed Slimmy"
+t "sealed marker keeps lowram and slim" eval 'grep -qx lowram=1 "$S/avdslim.golden" && grep -qx slim=apps "$S/avdslim.golden" && grep -qx "packages=app.ailo" "$S/avdslim.golden"'
+check "status shows slim and ram" 0 "$AVDSLIM" status Slimmy; contains "slim:     apps"; contains "ram 2048 (-lowram)"
+check "status --json shows slim" 0 "$AVDSLIM" status Slimmy --json; is_json "slim status"; contains '"slim":"apps","lowram":true'
+check "golden clone" 0 "$AVDSLIM" clone Slimmy slim-kid
+t "clone inherits lowram and slim" eval 'grep -qx lowram=1 "$ANDROID_AVD_HOME/slim-kid.avd/avdslim.managed" && grep -qx slim=apps "$ANDROID_AVD_HOME/slim-kid.avd/avdslim.managed"'
+t "clone keeps the golden's apps" grep -qx 'packages=app.ailo' "$ANDROID_AVD_HOME/slim-kid.avd/avdslim.managed"
+"$AVDSLIM" boot slim-kid >/dev/null 2>&1
+t "clone boot passes -lowram and loads the snapshot" eval 'has_arg slim-kid -lowram && ! has_arg slim-kid -no-snapshot-load'
+check "status --json of a clone shows slim" 0 "$AVDSLIM" status slim-kid --json; contains '"lowram":true'
+"$AVDSLIM" delete slim-kid --stop >/dev/null 2>&1
+check "--ram >= 2560 clears lowram" 0 "$AVDSLIM" slim Slimmy --golden --ram 3072
+t "lowram cleared" eval '! grep -q lowram "$S/avdslim.golden" && grep -q "^slim=apps" "$S/avdslim.golden"'
 
 # --- parallel boots get distinct ports; one AVD cannot be booted twice at once
 "$AVDSLIM" clone Base p1 >/dev/null; "$AVDSLIM" clone Base p2 >/dev/null; "$AVDSLIM" clone Base p3 >/dev/null
