@@ -11,6 +11,14 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/avdslim-test.XXXXXX")" || exit 1
 TMP="$(cd "$TMP" && pwd -P)"
 export ANDROID_AVD_HOME="$TMP/avd" AVDSLIM_STATE="$TMP/state" ANDROID_SDK_ROOT="$TMP/sdk" FAKE="$TMP/fake"
 mkdir -p "$ANDROID_AVD_HOME" "$TMP/sdk/emulator" "$TMP/sdk/platform-tools" "$FAKE"
+mkdir "$TMP/bin"
+cat > "$TMP/bin/ps" <<'EOF'
+#!/bin/bash
+/bin/ps "$@" | awk -v exe="$ANDROID_SDK_ROOT/emulator/emulator" 'index($0," " exe " -avd ")'
+EOF
+printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/lsof"
+chmod +x "$TMP/bin/"*
+export PATH="$TMP/bin:$PATH"
 cleanup() {
   local f
   for f in "$FAKE"/pid-*; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
@@ -46,12 +54,17 @@ cat > "$TMP/sdk/platform-tools/adb" <<'EOF'
 #!/bin/bash
 [ "${1:-}" = -s ] || exit 0 # start-server, devices
 port="${2#emulator-}"; shift 2
+if [ "$1" = wait-for-device ]; then
+  until [ -s "$FAKE/pid-$port" ]; do sleep 0.02; done
+  [ ! -e "$FAKE/not-ready" ] || exec sleep 10
+fi
 kill -0 "$(cat "$FAKE/pid-$port" 2>/dev/null)" 2>/dev/null || { echo "adb: device not found" >&2; exit 1; }
 name="$(cat "$FAKE/name-$port")"
 echo "$name: $*" >> "$FAKE/adb.log"
 case "$*" in
+  "emu avd name") echo "${FAKE_REPORTED_NAME:-$name}" ;;
   "shell getprop sys.boot_completed") echo 1 ;;
-  "shell pm list packages -3") cat "$FAKE/packages" 2>/dev/null ;;
+  *"pm list packages -3") cat "$FAKE/packages" 2>/dev/null ;;
   "emu avd snapshot save default_boot")
     mkdir -p "$ANDROID_AVD_HOME/$name.avd/snapshots/default_boot"
     echo saved > "$ANDROID_AVD_HOME/$name.avd/snapshots/default_boot/snapshot.pb"
@@ -101,6 +114,10 @@ make_avd Hand_Made
 check "list shows AVDs" 0 "$AVDSLIM" list; contains "Base"
 check "list --json" 0 "$AVDSLIM" list --json; is_json "list"
 check "status --json" 0 "$AVDSLIM" status Base --json; is_json "status"
+printf '%s\n' $'target=bad|\t"quoted"\\' > "$ANDROID_AVD_HOME/Odd.ini"
+mkdir "$ANDROID_AVD_HOME/Odd.avd"; touch "$ANDROID_AVD_HOME/Odd.avd/config.ini"
+check "list preserves unusual field values" 0 "$AVDSLIM" list --json; is_json "list controls"; contains 'bad|\t\"quoted\"'
+check "shutdown already stopped" 0 "$AVDSLIM" shutdown Base --json; is_json "stopped shutdown"
 
 # --- creating a golden: boot the fresh AVD, install, seal it while running
 check "boot a fresh AVD" 0 "$AVDSLIM" boot Base --json; is_json "boot"; contains '"snapshot":"cold"'
@@ -108,9 +125,11 @@ t "fresh AVD boots with the host GPU" has_arg Base "-gpu host"
 t "an unmanaged AVD keeps save-on-exit" eval '! has_arg Base -no-snapshot-save'
 check "boot again is idempotent" 0 "$AVDSLIM" boot Base; [ "$OUT" = emulator-5554 ] && ok "prints only the serial" || bad "prints only the serial: $OUT"
 check "install" 0 "$AVDSLIM" install Base "$0"; contains Success
+check "serial now belongs to a different AVD" 1 env FAKE_REPORTED_NAME=Elsewhere "$AVDSLIM" shutdown Base
+check "seal cannot silently record an empty manifest after adb fails" 1 "$AVDSLIM" golden Base
 echo "package:app.ailo" > "$FAKE/packages"
 check "seal a running AVD as golden" 0 "$AVDSLIM" golden Base; contains "sealed Base as golden with apps: app.ailo"
-t "seal flushed the disk before saving the snapshot" eval 'grep -A3 "^Base: shell sync" "$FAKE/adb.log" | grep -q "snapshot save"'
+t "seal flushed the disk before saving the snapshot" eval 'grep -A1 "^Base: shell .*sync && pm" "$FAKE/adb.log" | grep -q "snapshot save"'
 t "seal saved a snapshot" grep -q saved "$ANDROID_AVD_HOME/Base.avd/snapshots/default_boot/snapshot.pb"
 t "seal recorded the apps" grep -q '^packages=app.ailo$' "$ANDROID_AVD_HOME/Base.avd/avdslim.golden"
 check "golden is stopped after sealing" 1 "$AVDSLIM" serial Base
@@ -164,7 +183,11 @@ check "rejected snapshot is reported" 0 "$AVDSLIM" boot v1 --json; contains '"sn
 rm "$FAKE/snapshot-broken"; "$AVDSLIM" delete v1 --stop >/dev/null 2>&1
 "$AVDSLIM" clone Base v2 >/dev/null; : > "$FAKE/packages"
 check "missing golden apps fail the boot" 1 "$AVDSLIM" boot v2; contains "missing apps its golden had: app.ailo"
-[ "$OUT" = emulator-5554 ] && ok "serial still printed" || bad "serial still printed: $OUT"
+t "failed verification withholds serial" test -z "$OUT"
+check "retry still rejects missing apps" 1 "$AVDSLIM" boot v2
+touch "$FAKE/not-ready"
+check "timeout on already running but not ready" 1 "$AVDSLIM" boot v2 --timeout 1
+rm "$FAKE/not-ready"
 echo "package:app.ailo" > "$FAKE/packages"; "$AVDSLIM" delete v2 --stop >/dev/null 2>&1
 check "cold boot on request" 0 "$AVDSLIM" clone Base v3; "$AVDSLIM" boot v3 --cold >/dev/null 2>&1
 t "--cold skips the snapshot" has_arg v3 -no-snapshot-load
@@ -189,15 +212,18 @@ t "re-sealed snapshot records the host GPU" grep -q 'hw.gpu.mode = host' "$ANDRO
 wait
 ports="$(cat "$TMP/p1" "$TMP/p2" "$TMP/p3" | sort -u | tr '\n' ' ')"
 [ "$ports" = "emulator-5554 emulator-5556 emulator-5558 " ] && ok "three parallel boots, three ports" || bad "three parallel boots, three ports: $ports"
-t "locks released after boot" eval '[ -z "$(ls "$AVDSLIM_STATE" | grep lock)" ]'
-"$AVDSLIM" delete p1 p2 p3 --stop >/dev/null 2>&1
-mkdir -p "$AVDSLIM_STATE/port-5554.lock"; echo 99999999 > "$AVDSLIM_STATE/port-5554.lock/pid"
+check "batch delete" 0 "$AVDSLIM" delete p1 p2 p3 --stop --json; is_json "batch delete"
 "$AVDSLIM" clone Base p4 >/dev/null
-check "stale port lock is taken over" 0 "$AVDSLIM" boot p4; [ "$OUT" = emulator-5554 ] && ok "stale lock port reused" || bad "stale lock port reused: $OUT"
+check "released port can be reused" 0 "$AVDSLIM" boot p4; [ "$OUT" = emulator-5554 ] && ok "first free port reused" || bad "first free port reused: $OUT"
 "$AVDSLIM" shutdown p4 >/dev/null 2>&1
-mkdir -p "$AVDSLIM_STATE/boot-p4.lock"; echo $$ > "$AVDSLIM_STATE/boot-p4.lock/pid"
-check "boot of an AVD another avdslim is booting fails" 1 "$AVDSLIM" boot p4; contains "being booted by another avdslim"
-rm -rf "$AVDSLIM_STATE/boot-p4.lock"; "$AVDSLIM" delete p4 >/dev/null
+mkfifo "$TMP/ready"
+perl -MFcntl=:flock -e 'open my $f, ">>", $ARGV[0] or die; flock($f,LOCK_EX) or die; print "ready\n"; close STDOUT; sleep 60' \
+  "$AVDSLIM_STATE/locks/avd-p4" > "$TMP/ready" & locker=$!
+read -r _ < "$TMP/ready" || exit 1
+check "boot under lock refused" 1 "$AVDSLIM" boot p4; contains "busy"
+check "delete under lock refused" 1 "$AVDSLIM" delete p4
+kill -9 "$locker"; wait "$locker" 2>/dev/null
+check "owner crash releases lock" 0 "$AVDSLIM" delete p4
 
 # --- delete safety
 check "unmanaged AVD needs --force" 3 "$AVDSLIM" delete Hand_Made
@@ -213,6 +239,10 @@ mkdir -p "$TMP/target.avd"; echo x > "$TMP/target.avd/config.ini"; ln -s "$TMP/t
 printf 'path=%s/Linked.avd\n' "$ANDROID_AVD_HOME" > "$ANDROID_AVD_HOME/Linked.ini"
 check "symlinked AVD dir is refused" 3 "$AVDSLIM" delete Linked --force
 t "symlink target untouched" test -f "$TMP/target.avd/config.ini"
+make_avd Indirect
+printf 'path=%s/Base.avd/../Indirect.avd\n' "$ANDROID_AVD_HOME" > "$ANDROID_AVD_HOME/Indirect.ini"
+check "delete rejects indirect path even when it resolves inside home" 3 "$AVDSLIM" delete Indirect --force
+t "indirect dir untouched" test -f "$ANDROID_AVD_HOME/Indirect.avd/config.ini"
 
 # --- a running AVD that avdslim did not create is untouchable, even with --force
 check "boot the hand-made AVD" 0 "$AVDSLIM" boot Hand_Made
@@ -231,7 +261,12 @@ check "un-goldened AVD is unmanaged again" 3 "$AVDSLIM" delete Base
 check "unknown command" 2 "$AVDSLIM" frobnicate
 check "unknown option" 2 "$AVDSLIM" list --frobnicate
 check "bad --timeout" 2 "$AVDSLIM" boot Base --timeout soon
-check "help" 0 "$AVDSLIM" --help; contains "SAFETY RULES"
+check "octal timeout rejected" 2 "$AVDSLIM" boot Base --timeout 08
+check "unknown command without AVD home" 2 env ANDROID_AVD_HOME="$TMP/absent" "$AVDSLIM" frobnicate
+check "missing AVD home" 1 env ANDROID_AVD_HOME="$TMP/absent" "$AVDSLIM" list
+check "missing adb" 1 env PATH=/bin:/usr/bin ANDROID_SDK_ROOT="$TMP/absent" "$AVDSLIM" boot Base; contains "adb not found"
+check "multiline clone name normalized" 0 "$AVDSLIM" clone Base $'multi\nline'; contains "multi-line"
+check "help" 0 "$AVDSLIM" --help; contains 'SERIAL=$(avdslim boot'
 check "version" 0 "$AVDSLIM" version
 
 echo

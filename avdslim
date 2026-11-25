@@ -58,12 +58,12 @@ parse_args() {
     esac
     shift
   done
-  case "$OPT_TIMEOUT" in ''|*[!0-9]*) usage_die "--timeout needs a whole number of seconds, got '$OPT_TIMEOUT'" ;; esac
+  [[ $OPT_TIMEOUT =~ ^[1-9][0-9]{0,7}$ ]] || usage_die "--timeout needs 1 to 99999999 seconds"
 }
 
 # ---------------------------------------------------------------- names, ini files, markers
 
-sanitize_name() { printf '%s' "$1" | sed -e 's/[[:space:]][[:space:]]*/-/g' -e 's/[^A-Za-z0-9._-]/_/g'; }
+sanitize_name() { printf '%s' "$1" | LC_ALL=C tr -s '[:space:]' ' ' | LC_ALL=C tr ' ' '-' | LC_ALL=C tr -c 'A-Za-z0-9._-' '_'; }
 
 valid_name() {
   local re='^[A-Za-z0-9][A-Za-z0-9._-]*$'
@@ -77,11 +77,7 @@ ini_get() { # file key   (handles both `key=value` and `key = value`)
 
 # Only ever touch directories directly under the AVD home with the expected name.
 safe_avd_dir() { # name dir -> ok if dir is exactly $AVD_HOME/<name>.avd, a real dir, no symlink
-  local home real
-  home="$(cd "$AVD_HOME" 2>/dev/null && pwd -P)" || return 1
-  [ -d "$2" ] && [ ! -L "$2" ] && [ -f "$2/config.ini" ] || return 1
-  real="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
-  [ "$real" = "$home/$1.avd" ]
+  [ "$2" = "$AVD_HOME/$1.avd" ] && [ ! -L "$2" ] && [ -d "$2" ]
 }
 
 # Resolve an AVD by name -> AVD_DIR, AVD_INI. Dies if missing.
@@ -111,7 +107,7 @@ need_golden_flag() { # name what
 
 # find_running name -> sets R_PIDS (space separated) and R_PORT; returns 0 when running.
 find_running() {
-  [ -n "${PS_SNAP+x}" ] || PS_SNAP="$(ps -axo pid=,command= 2>/dev/null)"
+  [ -n "${PS_SNAP+x}" ] || PS_SNAP="$(ps -axo pid=,command=)" || die "cannot inspect running emulators"
   local out
   out="$(printf '%s\n' "$PS_SNAP" | awk -v n="$1" '
     index($0, "qemu-system") || index($0, "/emulator") {
@@ -147,39 +143,26 @@ refuse_if_running() { # name what
   return 0
 }
 
-# Locks are directories (mkdir is atomic) holding the owner's pid. A lock whose owner
-# died is taken over by renaming it away first, so two takers cannot both win.
-LOCKS=()
-try_lock() { # name
-  local lock="$STATE_DIR/$1.lock" pid
-  mkdir -p "$STATE_DIR" || die "cannot create $STATE_DIR"
-  if ! mkdir "$lock" 2>/dev/null; then
-    pid="$(cat "$lock/pid" 2>/dev/null)"
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 1
-    [ -n "$pid" ] || { sleep 0.2; [ ! -s "$lock/pid" ] || return 1; } # owner between mkdir and writing its pid
-    mv "$lock" "$lock.stale.$$" 2>/dev/null || return 1
-    if [ "$(cat "$lock.stale.$$/pid" 2>/dev/null)" != "$pid" ]; then # took a fresh lock by mistake: give it back
-      mv "$lock.stale.$$" "$lock" 2>/dev/null
-      return 1
-    fi
-    rm -rf "$lock.stale.$$"
-    mkdir "$lock" 2>/dev/null || return 1
-  fi
-  echo $$ > "$lock/pid"
-  LOCKS+=("$lock")
+# BSD flock stays with the open file description, including after Perl exits.
+# Never unlink lock files: all contenders must open the same inode.
+try_lock() { perl -MFcntl=:flock -e 'flock(STDIN, ($ARGV[0] eq "shared" ? LOCK_SH : LOCK_EX) | LOCK_NB) or exit 1' "${1:-exclusive}"; }
+lock_avd() {
+  valid_name "$1" || usage_die "invalid AVD name '$1'"
+  mkdir -p "$STATE_DIR/locks" || die "cannot create $STATE_DIR/locks"
+  exec 8>>"$STATE_DIR/locks/avd-$1" || die "cannot open lock for '$1'"
+  try_lock "${2:-exclusive}" <&8 || die "'$1' is busy; retry after the other avdslim command finishes"
 }
-release_locks() { [ ${#LOCKS[@]} -eq 0 ] || rm -rf "${LOCKS[@]}"; LOCKS=(); }
 
 # Claim the first free even console port (the emulator also takes port+1 for adb).
 pick_port() {
-  local used p
-  used=" $( {
-    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { n = split($9, a, ":"); print a[n] }'
-    ps -axo command= 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "-port") print $(i + 1) }'
-  } | tr '\n' ' ')"
+  local p processes
   for ((p = PORT_MIN; p <= PORT_MAX; p += 2)); do
-    case "$used" in *" $p "*|*" $((p + 1)) "*) continue ;; esac
-    try_lock "port-$p" && { PICKED_PORT="$p"; return 0; }
+    exec 9>>"$STATE_DIR/locks/port-$p" || die "cannot open port lock"
+    try_lock <&9 || continue
+    lsof -nP -iTCP:"$p-$((p+1))" -sTCP:LISTEN >/dev/null 2>&1 && continue
+    processes="$(ps -axo command=)" || die "cannot inspect port owners"
+    [[ " $processes " =~ [[:space:]]-port[[:space:]]+$p([[:space:]]|$) ]] && continue
+    PICKED_PORT="$p"; return 0
   done
   die "no free console port in $PORT_MIN-$PORT_MAX"
 }
@@ -196,88 +179,45 @@ wait_pids_gone() { # timeout-seconds pids...
   return 1
 }
 
-json_str() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+json_str() {
+  case "$1" in
+    *[[:cntrl:]]*) perl -MJSON::PP -MEncode=decode_utf8 -e 'print encode_json(decode_utf8($ARGV[0]))' -- "$1" ;;
+    *) local s="${1//\\/\\\\}"; printf '"%s"' "${s//\"/\\\"}" ;;
+  esac
+}
 json_opt() { [ -n "$1" ] && json_str "$1" || printf null; }
 
 # ---------------------------------------------------------------- help
 
 cmd_help() {
   cat <<'EOF'
-avdslim gives each task its own Android emulator: clone a "golden" AVD
-copy-on-write (about 0.4s, a few MB), boot it from the golden's snapshot in
-seconds, use it, delete it. The Android counterpart of simslim.
+Use one clone per <TASK-ID>-<role>. Only operate on your own clones.
+  avdslim clone Ailo_Golden_API34 SUBS-421-renter
+  SERIAL=$(avdslim boot SUBS-421-renter) || exit 1
+  adb -s "$SERIAL" shell getprop ro.build.version.sdk
+  avdslim delete SUBS-421-renter --stop
 
-USAGE
-  avdslim <command> [args] [options]
+avdslim <command>:
+  list [--booted]                  List AVDs; status <name> shows details
+  clone <source> <name>            Copy a stopped AVD (never another clone)
+  boot <name> [--window] [--cold] [--timeout S] [--no-animations]
+                                   Print the ready serial; default timeout 180s
+  serial <name>                    Print a running serial; exit 1 if unavailable
+  install <name> <apk>...          Install one APK or one split-APK set
+  shutdown <name>                  Sync and stop; a used clone cold boots next time
+  delete <name>... [--stop]        Remove clones; --stop can stop a running clone
+  golden <name> [--off]            Seal a running AVD (sync, record apps, save
+                                   snapshot, stop); mark only if stopped; --off unmarks
+  version                          Print version
 
-PER TASK
-  clone <golden> <name>     Clone a stopped AVD. Name it <TASK-ID>-<role>, e.g.
-                            SUBS-421-renter (spaces become '-'; the final name
-                            is printed). A clone cannot be cloned again.
-  boot <name>               Boot headless on a free port, wait until Android is
-                            up, print the serial (emulator-NNNN) on stdout.
-                            Already running: just prints the serial.
-                            A clone's first boot restores the golden's snapshot
-                            (seconds). After a shutdown it cold boots (about a
-                            minute) and keeps everything you installed.
-      --window              Show the emulator window
-      --cold                Skip the snapshot and cold boot
-      --timeout S           Boot wait limit in seconds (default 180)
-      --no-animations       Turn system animations off (not when testing motion)
-  serial <name>             Print the serial of a running AVD; exit 1 if stopped
-  install <name> <apk>...   adb install -r; several apks = one split-APK app
-  shutdown <name>           Flush the guest's disk, stop the emulator
-  delete <name>...          Delete stopped clones for good
-      --stop                Stop a running clone first
-      --force               Also delete a stopped AVD avdslim did not create
-  list [--booted]           All AVDs: name, state, serial, kind, target, device
-  status <name>             One AVD in detail
+Maintainers: --golden permits boot/install/delete on a golden. To refresh,
+cold boot it with --golden, install with --golden, then shutdown to seal.
+Use --force only to delete a stopped unmanaged AVD.
 
-GOLDEN AVDS (need --golden on boot, install and delete; never for task work)
-  golden <name>             Seal a RUNNING AVD as golden: flush its disk, save
-                            the boot snapshot, record its installed apps, stop
-                            it. On a stopped AVD: only mark it golden.
-  golden <name> --off       Remove the golden mark
-  shutdown <golden>         Same sealing as `golden`, so a refresh is:
-                              avdslim boot G --golden      (add --cold after an
-                                emulator upgrade or if boot warned about the
-                                snapshot: that rebuilds it from the disk)
-                              avdslim install G new.apk --golden
-                              avdslim shutdown G
-                            Clones made earlier keep the state they were cloned
-                            with.
-
-OPTIONS
-  --json                    JSON on stdout (list, status, clone, boot,
-                            shutdown, delete)
-  -h, --help                This help
-  version                   Print the version
-
-OUTPUT AND EXIT CODES
-  Results go to stdout, progress and warnings to stderr.
-  0 ok, 1 failure, 2 usage error, 3 refused by a safety rule (do not work
-  around it).
-
-WHAT BOOT CHECKS
-  * It reports how the emulator started: snapshot "loaded", "cold", or "failed"
-    (a snapshot existed but the emulator rejected it and cold booted; the
-    reason is printed). Window and headless boots share one snapshot because
-    both use the host GPU.
-  * It compares the installed third-party apps with the list recorded when the
-    golden was sealed and exits 1 if any are missing.
-
-SAFETY RULES
-  * A running AVD is never cloned or deleted, except `delete --stop` on a clone.
-  * `delete` only removes clones unless --force is given, and only a directory
-    named <name>.avd directly inside the AVD home.
-  * Only touch clones you created.
-
-ENVIRONMENT
-  ANDROID_SDK_ROOT / ANDROID_HOME   SDK location (default ~/Library/Android/sdk)
-  ANDROID_AVD_HOME                  AVD directory (default ~/.android/avd)
-  AVDSLIM_STATE                     Logs and locks (default ~/.local/state/avdslim)
-
-Emulator logs: $AVDSLIM_STATE/logs/<name>.log
+Use --json with list/status/clone/boot/shutdown/delete. Diagnostics use stderr.
+Exit: 0 success, 1 failure, 2 usage, 3 safety refusal (do not work around it).
+SDK: ANDROID_SDK_ROOT or ANDROID_HOME. Devices: ANDROID_AVD_HOME.
+Logs: ${AVDSLIM_STATE:-${XDG_STATE_HOME:-~/.local/state}/avdslim}/logs/<name>.log
 EOF
 }
 
@@ -285,7 +225,8 @@ EOF
 
 cmd_list() {
   [ ${#POS[@]} -eq 0 ] || usage_die "usage: avdslim list [--booted] [--json]"
-  local f name dir state serial rows=""
+  local f name dir state serial kind target device rows="" sep=""
+  [ "$JSON" = 0 ] || printf '['
   for f in "$AVD_HOME"/*.ini; do
     [ -f "$f" ] || continue
     name="$(basename "$f" .ini)"
@@ -295,20 +236,17 @@ cmd_list() {
     state=stopped; serial=""
     if find_running "$name"; then state=running; serial="${R_PORT:+emulator-$R_PORT}"; fi
     [ "$BOOTED_ONLY" = 0 ] || [ "$state" = running ] || continue
-    rows="$rows$name|$state|$serial|$(kind_of "$dir")|$(ini_get "$f" target)|$(ini_get "$dir/config.ini" hw.device.name)"$'\n'
-  done
-  if [ "$JSON" = 1 ]; then
-    local sep="" kind target device
-    printf '['
-    while IFS='|' read -r name state serial kind target device; do
-      [ -n "$name" ] || continue
+    kind="$(kind_of "$dir")"; target="$(ini_get "$f" target)"; device="$(ini_get "$dir/config.ini" hw.device.name)"
+    if [ "$JSON" = 1 ]; then
       printf '%s{"name":%s,"state":%s,"serial":%s,"kind":%s,"target":%s,"device":%s}' "$sep" \
         "$(json_str "$name")" "$(json_str "$state")" "$(json_opt "$serial")" \
         "$(json_str "$kind")" "$(json_str "$target")" "$(json_str "$device")"
       sep=","
-    done <<EOF
-$rows
-EOF
+    else
+      rows="$rows$name|$state|$serial|$kind|$target|$device"$'\n'
+    fi
+  done
+  if [ "$JSON" = 1 ]; then
     printf ']\n'
   else
     printf 'NAME|STATE|SERIAL|KIND|TARGET|DEVICE\n%s' "$rows" | awk -F'|' '
@@ -383,14 +321,17 @@ cmd_clone() {
   name="$(sanitize_name "$want")"
   valid_name "$name" || usage_die "cannot derive a valid AVD name from '$want' (got '$name'; start with a letter or digit, max 64 chars)"
   [ "$name" = "$want" ] || note "name sanitized: '$want' -> '$name'"
+  lock_avd "$src" shared
+  exec 9>>"$STATE_DIR/locks/avd-$name" || die "cannot open clone lock"
+  try_lock <&9 || die "'$name' is busy; retry with a different clone name"
   require_avd "$src"
   src_dir="$AVD_DIR"; src_ini="$AVD_INI"
   # A clone that has run no longer matches the snapshot it carries.
   [ "$(kind_of "$src_dir")" != clone ] || refuse "'$src' is itself a clone; clone its golden ($(ini_get "$src_dir/avdslim.managed" source)) instead"
   refuse_if_running "$src" "cloning (a live copy would be inconsistent)"
-  if [ -e "$AVD_HOME/$name.ini" ] || [ -e "$AVD_HOME/$name.avd" ]; then die "AVD '$name' already exists"; fi
+  if [ -e "$AVD_HOME/$name.ini" ] || [ -L "$AVD_HOME/$name.ini" ] || [ -e "$AVD_HOME/$name.avd" ] || [ -L "$AVD_HOME/$name.avd" ]; then die "AVD '$name' already exists"; fi
   tmp="$AVD_HOME/.$name.avd.avdslim-tmp"
-  [ ! -e "$tmp" ] || die "stale temporary directory $tmp; remove it and retry"
+  [ ! -e "$tmp" ] && [ ! -L "$tmp" ] && [ ! -e "$AVD_HOME/.$name.ini.avdslim-tmp" ] && [ ! -L "$AVD_HOME/.$name.ini.avdslim-tmp" ] || die "stale staging files for '$name'; inspect $AVD_HOME before retrying"
   t0="$(now_ms)"
   if ! cp -c -R "$src_dir" "$tmp" 2>/dev/null; then
     rm -rf "$tmp"
@@ -419,7 +360,7 @@ cmd_clone() {
     [ "$home_parent" != avd ] || echo "path.rel=avd/$name.avd"
   } > "$AVD_HOME/.$name.ini.avdslim-tmp"
   mv "$tmp" "$AVD_HOME/$name.avd" || { rm -rf "$tmp" "$AVD_HOME/.$name.ini.avdslim-tmp"; die "could not move clone into place"; }
-  mv "$AVD_HOME/.$name.ini.avdslim-tmp" "$AVD_HOME/$name.ini"
+  mv "$AVD_HOME/.$name.ini.avdslim-tmp" "$AVD_HOME/$name.ini" || die "could not register '$name'; inspect $AVD_HOME"
   k=$(($(now_ms) - t0))
   if [ "$JSON" = 1 ]; then
     printf '{"name":%s,"source":%s,"path":%s,"ms":%s}\n' "$(json_str "$name")" "$(json_str "$src")" "$(json_str "$AVD_HOME/$name.avd")" "$k"
@@ -430,18 +371,54 @@ cmd_clone() {
 
 # ---------------------------------------------------------------- boot / serial / install
 
-third_party_packages() { # serial -> sorted, space separated
-  "$ADB" -s "$1" shell pm list packages -3 2>/dev/null | tr -d '\r' | sed -n 's/^package://p' | sort | tr '\n' ' ' | sed 's/ $//'
+third_party_packages() { # serial [guest command] -> space-separated packages
+  "$ADB" -s "$1" shell "${2:-pm list packages -3}" | awk '/^package:/ {sub(/^package:/,""); sub(/\r$/,""); printf "%s%s", sep,$0; sep=" "}'
+}
+
+verify_apps() {
+  local want have p missing=""
+  want="$(ini_get "$AVD_DIR/avdslim.managed" packages)"
+  [ -n "$want" ] || return 0
+  have="$(third_party_packages "$2")" || die "cannot check apps on '$1'; inspect adb and retry boot"
+  for p in $want; do case " $have " in *" $p "*) ;; *) missing="$missing $p" ;; esac; done
+  [ -z "$missing" ] || die "$1 is missing apps its golden had:$missing. Delete your clone with --stop and clone again; if that repeats, re-seal the golden"
+}
+
+verify_serial() {
+  [ "$("$ADB" -s "$2" emu avd name | sed -n '1{s/\r$//;p;}')" = "$1" ] ||
+    die "cannot confirm that $2 belongs to '$1'; inspect avdslim status before retrying"
+}
+
+wait_for_android() {
+  local name="$1" serial="$2" pid="$3" waiter
+  # Wait on the transport and poll inside Android, rather than spawning adb on every tick.
+  perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$OPT_TIMEOUT" "$ADB" -s "$serial" wait-for-device shell \
+    'until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 0.2; done' 8>&- 9>&- </dev/null >/dev/null 2>&1 &
+  waiter=$!
+  while kill -0 "$waiter" 2>/dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      kill "$waiter" 2>/dev/null
+      wait "$waiter" 2>/dev/null
+      die "emulator exited; see $STATE_DIR/logs/$name.log"
+    fi
+    sleep 0.1
+  done
+  wait "$waiter" || die "boot timed out or adb disconnected; see $STATE_DIR/logs/$name.log, then retry boot"
+  verify_serial "$name" "$serial"
 }
 
 cmd_boot() {
   [ ${#POS[@]} -eq 1 ] || usage_die "usage: avdslim boot <name> [--window] [--cold] [--timeout S] [--no-animations]"
-  local name="${POS[0]}" kind t0 ms args log serial pid i rc=1 snap gpu snapshot=cold want have p missing=""
+  local name="${POS[0]}" kind t0 ms args log serial pid snap gpu snapshot=cold p
+  lock_avd "$name"
   require_avd "$name"
   need_golden_flag "$name" "booting it"
   if find_running "$name"; then
     [ -n "$R_PORT" ] || die "'$name' is running but its serial could not be determined"
-    note "$name already running as emulator-$R_PORT"
+    need_adb
+    pid="${R_PIDS# }"
+    wait_for_android "$name" "emulator-$R_PORT" "${pid%% *}"
+    verify_apps "$name" "emulator-$R_PORT"
     emit_boot "$name" "emulator-$R_PORT" 0 running
     return 0
   fi
@@ -449,8 +426,6 @@ cmd_boot() {
   kind="$(kind_of "$AVD_DIR")"
   mkdir -p "$STATE_DIR/logs" || die "cannot create $STATE_DIR/logs"
   log="$STATE_DIR/logs/$name.log"
-  trap release_locks EXIT
-  try_lock "boot-$name" || die "'$name' is being booted by another avdslim; wait for it, then run boot again"
   pick_port
   serial="emulator-$PICKED_PORT"
   args=(-avd "$name" -port "$PICKED_PORT" -no-boot-anim -no-audio -no-metrics)
@@ -488,22 +463,10 @@ cmd_boot() {
   fi
 
   t0="$(now_ms)"
-  "$ADB" start-server >/dev/null 2>&1
   # setsid: the emulator must survive the shell (and the agent's process group) that booted it.
-  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' -- "$EMULATOR" "${args[@]}" </dev/null >"$log" 2>&1 &
+  perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' -- "$EMULATOR" "${args[@]}" 8>&- 9>&- </dev/null >"$log" 2>&1 &
   pid=$!
-  for ((i = 0; i < OPT_TIMEOUT * 4; i++)); do
-    kill -0 "$pid" 2>/dev/null || { rc=2; break; }
-    [ "$("$ADB" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && { rc=0; break; }
-    sleep 0.25
-  done
-  release_locks
-  if [ "$rc" -ne 0 ]; then
-    [ "$rc" = 2 ] && note "emulator exited during boot; last log lines:" ||
-      note "timed out after ${OPT_TIMEOUT}s; left running as $serial (avdslim shutdown $name); last log lines:"
-    tail -n 8 "$log" >&2
-    exit 1
-  fi
+  wait_for_android "$name" "$serial" "$pid"
   if [ "$snapshot" = loaded ] && ! grep -q "Successfully loaded snapshot" "$log"; then
     snapshot=failed
     warn "$name did NOT start from its snapshot and cold booted instead: $(sed -n 's/.*starting from scratch\. Reason: //p; s/^WARNING *| *\(.*snapshot.*\)/\1/p' "$log" | tail -1)"
@@ -513,15 +476,10 @@ cmd_boot() {
     "$ADB" -s "$serial" shell settings put global "$p" 0 >/dev/null 2>&1
   done
   # The golden's apps must be there however the emulator started.
-  want="$(ini_get "$AVD_DIR/avdslim.managed" packages)"
-  if [ -n "$want" ]; then
-    have=" $(third_party_packages "$serial") "
-    for p in $want; do case "$have" in *" $p "*) ;; *) missing="$missing $p" ;; esac; done
-  fi
+  verify_apps "$name" "$serial"
   ms=$(($(now_ms) - t0))
   note "$name booted as $serial in $(fmt_secs "$ms") (snapshot $snapshot)"
   emit_boot "$name" "$serial" "$ms" "$snapshot"
-  [ -z "$missing" ] || die "$name is missing apps its golden had:$missing. Do not use it: delete it and clone again; if that repeats, the golden needs re-sealing (avdslim --help)"
 }
 
 emit_boot() { # name serial ms snapshot(loaded|cold|failed|running)
@@ -543,11 +501,13 @@ cmd_serial() {
 cmd_install() {
   [ ${#POS[@]} -ge 2 ] || usage_die "usage: avdslim install <name> <apk>..."
   local name="${POS[0]}" f
+  lock_avd "$name"
   for f in "${POS[@]:1}"; do [ -f "$f" ] || die "no such file: $f"; done
   require_avd "$name"
   need_golden_flag "$name" "installing onto it"
   find_running "$name" && [ -n "$R_PORT" ] || die "'$name' is not running (avdslim boot $name)"
   need_adb
+  verify_serial "$name" "emulator-$R_PORT"
   if [ ${#POS[@]} -eq 2 ]; then
     "$ADB" -s "emulator-$R_PORT" install -r -d "${POS[1]}"
   else
@@ -568,27 +528,24 @@ stop_avd() { # name mode
   local name="$1" mode="$2" serial="${R_PORT:+emulator-$R_PORT}" pids="$R_PIDS" t0 out pkgs="" snap="$AVD_DIR/snapshots/default_boot/snapshot.pb"
   t0="$(now_ms)"
   need_adb
-  if [ "$mode" != discard ]; then
-    [ -n "$serial" ] && "$ADB" -s "$serial" shell sync >/dev/null 2>&1 ||
-      { [ "$mode" = keep ] && warn "could not flush $name's disk; recent changes may be lost" || die "cannot reach $name over adb; not sealed, left running"; }
+  [ -n "$serial" ] || die "cannot determine the serial for '$name'; stop it in Device Manager"
+  verify_serial "$name" "$serial"
+  if [ "$mode" = keep ]; then
+    "$ADB" -s "$serial" shell sync || die "could not flush '$name'; left running, retry shutdown"
   fi
   if [ "$mode" = seal ]; then
-    [ "$("$ADB" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] || die "$name has not finished booting; not sealed, left running"
-    pkgs="$(third_party_packages "$serial")"
-    out="$("$ADB" -s "$serial" emu avd snapshot save default_boot 2>&1)"
-    case "$out" in OK*) [ -f "$snap" ] ;; *) false ;; esac || die "saving $name's snapshot failed ($out); not sealed, left running"
+    # shellcheck disable=SC2016 # getprop must run in the guest
+    pkgs="$(third_party_packages "$serial" '[ "$(getprop sys.boot_completed)" = 1 ] && sync && pm list packages -3')" ||
+      die "cannot flush and list apps on '$name'; not sealed, left running"
+    out="$("$ADB" -s "$serial" emu avd snapshot save default_boot 2>&1)" &&
+      [[ $out = OK* ]] && [ -f "$snap" ] || die "saving $name's snapshot failed ($out); not sealed, left running"
   fi
-  [ -z "$serial" ] || "$ADB" -s "$serial" emu kill >/dev/null 2>&1
+  "$ADB" -s "$serial" emu kill >/dev/null || die "could not stop '$name'; check avdslim status"
   # shellcheck disable=SC2086
-  if ! wait_pids_gone 30 $pids; then
-    warn "$name did not exit after 30s; sending SIGTERM"
-    # shellcheck disable=SC2086
-    kill $pids 2>/dev/null
-    # shellcheck disable=SC2086
-    wait_pids_gone 10 $pids || die "could not stop $name (pids:$pids)"
-  fi
+  wait_pids_gone 30 $pids || die "'$name' has not exited; check avdslim status"
   if [ "$mode" = seal ]; then
-    printf 'created=%s\npackages=%s\n' "$(utc_now)" "$pkgs" > "$AVD_DIR/avdslim.golden"
+    printf 'created=%s\npackages=%s\n' "$(utc_now)" "$pkgs" > "$AVD_DIR/avdslim.golden.new" &&
+      mv "$AVD_DIR/avdslim.golden.new" "$AVD_DIR/avdslim.golden" || die "cannot publish golden marker; inspect $AVD_DIR"
     rm -f "$AVD_DIR/avdslim.managed"
     note "sealed $name as golden with apps: ${pkgs:-(none)}"
   fi
@@ -602,8 +559,9 @@ stop_avd() { # name mode
 cmd_shutdown() {
   [ ${#POS[@]} -eq 1 ] || usage_die "usage: avdslim shutdown <name>"
   local name="${POS[0]}" mode=keep
+  lock_avd "$name"
   require_avd "$name"
-  find_running "$name" || { note "$name is not running"; return 0; }
+  find_running "$name" || { note "$name is not running"; [ "$JSON" = 0 ] || printf '{"name":%s,"stopped":true,"sealed":false,"ms":0}\n' "$(json_str "$name")"; return 0; }
   [ "$(kind_of "$AVD_DIR")" != golden ] || mode=seal
   stop_avd "$name" "$mode"
 }
@@ -611,6 +569,7 @@ cmd_shutdown() {
 cmd_golden() {
   [ ${#POS[@]} -eq 1 ] || usage_die "usage: avdslim golden <name> [--off]"
   local name="${POS[0]}"
+  lock_avd "$name"
   require_avd "$name"
   safe_avd_dir "$name" "$AVD_DIR" || refuse "'$name' is not a plain <name>.avd directory inside $AVD_HOME"
   if [ "$OFF" = 1 ]; then
@@ -627,6 +586,8 @@ cmd_golden() {
 
 delete_one() {
   local name="$1" kind
+  lock_avd "$name"
+  unset PS_SNAP
   require_avd "$name"
   safe_avd_dir "$name" "$AVD_DIR" || refuse "'$name' is not a plain <name>.avd directory inside $AVD_HOME; delete it with avdmanager"
   kind="$(kind_of "$AVD_DIR")"
@@ -636,19 +597,24 @@ delete_one() {
   esac
   if find_running "$name"; then
     # --force never overrides this: a running AVD that avdslim did not create may be in use.
-    [ "$kind" != avd ] || refuse "'$name' is running and was not created by avdslim; stop it yourself first"
+    [ "$kind" = clone ] || refuse "'$name' is running and is not a task clone; stop it yourself first"
     [ "$STOP" = 1 ] || refuse "'$name' is running; shut it down first or pass --stop"
     JSON=0 stop_avd "$name" discard >&2
   fi
   rm -rf -- "$AVD_DIR" || die "could not remove $AVD_DIR"
   rm -f -- "$AVD_HOME/$name.ini" "$STATE_DIR/logs/$name.log"
-  if [ "$JSON" = 1 ]; then printf '{"name":%s,"deleted":true}\n' "$(json_str "$name")"; else echo "deleted $name"; fi
+  [ "$JSON" = 1 ] || echo "deleted $name"
 }
 
 cmd_delete() {
   [ ${#POS[@]} -ge 1 ] || usage_die "usage: avdslim delete <name>... [--stop] [--force]"
-  local n
-  for n in "${POS[@]}"; do PS_SNAP="$(ps -axo pid=,command= 2>/dev/null)"; delete_one "$n"; done
+  local n results=""
+  for n in "${POS[@]}"; do
+    delete_one "$n"
+    [ "$JSON" = 0 ] || results="${results:+$results,}{\"name\":$(json_str "$n"),\"deleted\":true}"
+  done
+  [ "$JSON" = 1 ] || return 0
+  if [ ${#POS[@]} = 1 ]; then echo "$results"; else echo "[$results]"; fi
 }
 
 # ---------------------------------------------------------------- main
@@ -662,7 +628,12 @@ main() {
     help|-h|--help) cmd_help; exit 0 ;;
     version|--version) echo "avdslim $AVDSLIM_VERSION"; exit 0 ;;
   esac
-  [ -d "$AVD_HOME" ] || die "AVD home not found: $AVD_HOME (set ANDROID_AVD_HOME)"
+  case "$cmd" in
+    list|ls|status|clone|boot|shutdown|stop|delete|rm) ;;
+    install|golden|serial) [ "$JSON" = 0 ] || usage_die "--json is not supported by $cmd" ;;
+    *) usage_die "unknown command: $cmd" ;;
+  esac
+  [ -d "$AVD_HOME" ] || die "AVD home not found: $AVD_HOME (create an AVD or set ANDROID_AVD_HOME)"
   case "$cmd" in
     list|ls) cmd_list ;;
     status) cmd_status ;;
