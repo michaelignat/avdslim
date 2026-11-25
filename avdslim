@@ -7,7 +7,7 @@
 set -u
 set -o pipefail
 
-AVDSLIM_VERSION="0.2.0"
+AVDSLIM_VERSION="0.3.0"
 PORT_MIN=5554
 PORT_MAX=5682 # the emulator's own console port range
 
@@ -35,6 +35,7 @@ utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 JSON=0; GOLDEN_OK=0; FORCE=0; BOOTED_ONLY=0; WINDOW=0; COLD=0; STOP=0; NO_ANIM=0; OFF=0
 OPT_TIMEOUT=180
+EXCEPT=""; WITH=""; RAM=""
 POS=()
 
 parse_args() {
@@ -52,6 +53,8 @@ parse_args() {
       -h|--help) cmd_help; exit 0 ;;
       --timeout) [ $# -ge 2 ] || usage_die "$1 needs a value"; OPT_TIMEOUT="$2"; shift ;;
       --timeout=*) OPT_TIMEOUT="${1#*=}" ;;
+      --except|--with|--ram) [ $# -ge 2 ] || usage_die "$1 needs a value"
+        case "$1" in --except) EXCEPT="$2" ;; --with) WITH="$2" ;; *) RAM="$2" ;; esac; shift ;;
       --) shift; POS+=("$@"); break ;;
       -*) usage_die "unknown option: $1" ;;
       *) POS+=("$1") ;;
@@ -94,8 +97,13 @@ require_avd() {
 # Markers inside the AVD directory:
 #   avdslim.golden   a sealed clone source (packages=... lists its third-party apps)
 #   avdslim.managed  a clone made by avdslim (source=, created=, packages=)
+# Both may also carry lowram=1 (boot with -lowram) and slim=<categories> from `avdslim slim`.
 kind_of() { # dir
   if [ -f "$1/avdslim.golden" ]; then echo golden; elif [ -f "$1/avdslim.managed" ]; then echo clone; else echo avd; fi
+}
+
+marker_set() { # file key [value]; an empty value removes the key
+  { grep -v "^$2=" "$1" || :; [ -z "${3:-}" ] || echo "$2=$3"; } > "$1.new" && mv "$1.new" "$1" || die "cannot update $1"
 }
 
 need_golden_flag() { # name what
@@ -211,10 +219,17 @@ avdslim <command>:
   delete <name>... [--stop]        Remove clones; --stop can stop a running clone
   golden <name> [--off]            Seal a running AVD (sync, record apps, save
                                    snapshot, stop); mark only if stopped; --off unmarks
+  slim <name> --golden [--except cat,...] [--with gms] [--off]
+                                   Running golden: disable unused packages. Categories:
+                                   apps assistant telephony wallpaper telemetry radios
+                                   (default), gms (opt-in). --off undoes them
+  slim <name> --ram MB --golden    Stopped golden: set guest RAM; below 2560 it boots
+                                   with -lowram (cold boot and re-seal afterwards)
   version                          Print version
 
-Maintainers: --golden permits boot/install/delete on a golden. To refresh,
+Maintainers: --golden permits boot/install/delete/slim on a golden. To refresh,
 cold boot it with --golden, install with --golden, then shutdown to seal.
+Slim: slim --ram 2048 (stopped), boot --cold, slim, shutdown. Clones inherit it.
 Use --force only to delete a stopped unmanaged AVD.
 
 Use --json with list/status/clone/boot/shutdown/delete. Diagnostics use stderr.
@@ -260,7 +275,7 @@ cmd_list() {
 
 cmd_status() {
   [ ${#POS[@]} -eq 1 ] || usage_die "usage: avdslim status <name>"
-  local name="${POS[0]}" state=stopped serial="" pid="" boot="" marker size ram src created kind target device pkgs
+  local name="${POS[0]}" state=stopped serial="" pid="" boot="" marker size ram src created kind target device pkgs slim lowram
   require_avd "$name"
   if find_running "$name"; then
     state=running; serial="${R_PORT:+emulator-$R_PORT}"; pid="${R_PIDS# }"; pid="${pid%% *}"
@@ -278,11 +293,14 @@ cmd_status() {
   src="$(ini_get "$marker" source)"
   created="$(ini_get "$marker" created)"
   pkgs="$(ini_get "$marker" packages)"
+  slim="$(ini_get "$marker" slim)"
+  lowram="$(ini_get "$marker" lowram)"
   if [ "$JSON" = 1 ]; then
-    printf '{"name":%s,"state":%s,"serial":%s,"pid":%s,"boot_completed":%s,"kind":%s,"source":%s,"created":%s,"packages":%s,"target":%s,"device":%s,"ram":%s,"path":%s,"size_kb":%s}\n' \
+    printf '{"name":%s,"state":%s,"serial":%s,"pid":%s,"boot_completed":%s,"kind":%s,"source":%s,"created":%s,"packages":%s,"slim":%s,"lowram":%s,"target":%s,"device":%s,"ram":%s,"path":%s,"size_kb":%s}\n' \
       "$(json_str "$name")" "$(json_str "$state")" "$(json_opt "$serial")" "${pid:-null}" \
       "$([ "$boot" = 1 ] && echo true || echo false)" "$(json_str "$kind")" \
-      "$(json_opt "$src")" "$(json_opt "$created")" "$(json_str "$pkgs")" \
+      "$(json_opt "$src")" "$(json_opt "$created")" "$(json_str "$pkgs")" "$(json_str "$slim")" \
+      "$([ "$lowram" = 1 ] && echo true || echo false)" \
       "$(json_str "$target")" "$(json_str "$device")" "$(json_str "$ram")" "$(json_str "$AVD_DIR")" "${size:-0}"
   else
     echo "name:     $name"
@@ -291,8 +309,9 @@ cmd_status() {
     echo "kind:     $kind"
     [ -n "$src" ] && echo "source:   $src ($created)"
     [ -n "$pkgs" ] && echo "packages: $pkgs"
+    [ -n "$slim" ] && echo "slim:     $slim"
     echo "target:   $target"
-    echo "device:   $device, ram $ram"
+    echo "device:   $device, ram $ram$([ "$lowram" = 1 ] && echo ' (-lowram)')"
     echo "path:     $AVD_DIR"
     echo "size:     $((${size:-0} / 1024)) MB (includes blocks a clone still shares with its source)"
   fi
@@ -321,7 +340,7 @@ fix_backing_files() { # dir srcdir
 
 cmd_clone() {
   [ ${#POS[@]} -eq 2 ] || usage_die "usage: avdslim clone <src> <name>"
-  local src="${POS[0]}" want="${POS[1]}" name tmp t0 src_dir src_ini src_re home_parent pkgs k h
+  local src="${POS[0]}" want="${POS[1]}" name tmp t0 src_dir src_ini src_re home_parent pkgs keep k h
   name="$(sanitize_name "$want")"
   valid_name "$name" || usage_die "cannot derive a valid AVD name from '$want' (got '$name'; start with a letter or digit, max 64 chars)"
   [ "$name" = "$want" ] || note "name sanitized: '$want' -> '$name'"
@@ -343,6 +362,7 @@ cmd_clone() {
     cp -R "$src_dir" "$tmp" || { rm -rf "$tmp"; die "copy failed"; }
   fi
   pkgs="$(ini_get "$tmp/avdslim.golden" packages)"
+  keep="$(grep -E '^(lowram|slim)=' "$tmp/avdslim.golden" 2>/dev/null)" # the golden's boot flag and slim profile
   # Drop what belongs to one running instance or to the source's identity.
   (cd "$tmp" && rm -rf ./*.lock hardware-qemu.ini emulator-user.ini bootcompleted.ini emu-launch-params.txt \
     read-snapshot.txt tmpAdbCmds avdslim.golden avdslim.managed) || die "cannot clean staging directory $tmp"
@@ -355,7 +375,7 @@ cmd_clone() {
     [ -f "$h" ] || continue
     sed -i '' -E -e "s#/$src_re\.avd/#/$name.avd/#g" -e "s#^(avd\.(name|id) *= *)$src_re\$#\1$name#" "$h" || die "cannot update $h"
   done
-  printf 'source=%s\ncreated=%s\npackages=%s\n' "$src" "$(utc_now)" "$pkgs" > "$tmp/avdslim.managed" || die "cannot mark staged clone"
+  printf 'source=%s\ncreated=%s\npackages=%s\n%s' "$src" "$(utc_now)" "$pkgs" "${keep:+$keep$'\n'}" > "$tmp/avdslim.managed" || die "cannot mark staged clone"
   # path.rel is relative to the AVD home's parent; only valid for the standard layout.
   home_parent="$(basename "$AVD_HOME")"
   {
@@ -413,7 +433,7 @@ wait_for_android() {
 
 cmd_boot() {
   [ ${#POS[@]} -eq 1 ] || usage_die "usage: avdslim boot <name> [--window] [--cold] [--timeout S] [--no-animations]"
-  local name="${POS[0]}" kind t0 ms args log serial pid snap gpu snapshot=cold p
+  local name="${POS[0]}" kind t0 ms args log serial pid snap gpu snapshot=cold p mk=managed
   lock_avd "$name"
   require_avd "$name"
   need_golden_flag "$name" "booting it"
@@ -434,6 +454,10 @@ cmd_boot() {
   serial="emulator-$PICKED_PORT"
   args=(-avd "$name" -port "$PICKED_PORT" -no-boot-anim -no-audio -no-metrics)
   [ "$WINDOW" = 1 ] || args+=(-no-window)
+  # Below 2560 MB the emulator raises the guest's RAM unless -lowram is given. A snapshot
+  # only loads with the same choice, so the sealed golden records it and clones copy it.
+  [ "$kind" != golden ] || mk=golden
+  [ "$(ini_get "$AVD_DIR/avdslim.$mk" lowram)" != 1 ] || args+=(-lowram)
   # Golden AVDs save their snapshot only when sealed and clones never save one; an AVD
   # avdslim does not manage keeps the emulator's own save-on-exit behaviour.
   [ "$kind" = avd ] || args+=(-no-snapshot-save)
@@ -529,7 +553,7 @@ cmd_install() {
 # part of the saved RAM) until the first cold boot, where recently installed apps are
 # simply gone. Hence the explicit sync before every stop that keeps the disk.
 stop_avd() { # name mode
-  local name="$1" mode="$2" serial="${R_PORT:+emulator-$R_PORT}" pids="$R_PIDS" t0 out pkgs="" snap="$AVD_DIR/snapshots/default_boot/snapshot.pb"
+  local name="$1" mode="$2" serial="${R_PORT:+emulator-$R_PORT}" pids="$R_PIDS" t0 out pkgs="" keep snap="$AVD_DIR/snapshots/default_boot/snapshot.pb"
   t0="$(now_ms)"
   need_adb
   [ -n "$serial" ] || die "cannot determine the serial for '$name'; stop it in Device Manager"
@@ -548,7 +572,8 @@ stop_avd() { # name mode
   # shellcheck disable=SC2086
   wait_pids_gone 30 $pids || die "'$name' has not exited; check avdslim status"
   if [ "$mode" = seal ]; then
-    printf 'created=%s\npackages=%s\n' "$(utc_now)" "$pkgs" > "$AVD_DIR/avdslim.golden.new" &&
+    keep="$(grep -E '^(lowram|slim)=' "$AVD_DIR/avdslim.golden" 2>/dev/null)"
+    printf 'created=%s\npackages=%s\n%s' "$(utc_now)" "$pkgs" "${keep:+$keep$'\n'}" > "$AVD_DIR/avdslim.golden.new" &&
       mv "$AVD_DIR/avdslim.golden.new" "$AVD_DIR/avdslim.golden" || die "cannot publish golden marker; inspect $AVD_DIR"
     rm -f "$AVD_DIR/avdslim.managed"
     note "sealed $name as golden with apps: ${pkgs:-(none)}"
@@ -586,6 +611,70 @@ cmd_golden() {
     [ -f "$AVD_DIR/avdslim.golden" ] || printf 'created=%s\npackages=\n' "$(utc_now)" > "$AVD_DIR/avdslim.golden"
     echo "$name is now golden (marked only: seal it while running to make its apps durable and checked)"
   fi
+}
+
+# ---------------------------------------------------------------- slim
+
+SLIM_ALL="apps assistant telephony wallpaper telemetry radios gms"
+SLIM_DEFAULT="apps assistant telephony wallpaper telemetry radios"
+# Never list: phone, webview, latin IME, nexuslauncher, permissioncontroller, media provider,
+# documentsui, networkstack, packageinstaller. Missing or protected packages are skipped.
+slim_pkgs() {
+  case "$1" in
+    apps) echo com.google.android.youtube com.google.android.apps.youtube.music com.google.android.gm com.google.android.apps.docs com.google.android.apps.maps com.google.android.apps.photos com.google.android.calendar com.google.android.contacts com.google.android.deskclock com.google.android.apps.wellbeing com.google.android.projection.gearhead com.google.android.apps.restore com.google.android.feedback com.google.android.markup com.android.chrome com.google.android.apps.messaging com.google.android.dialer com.android.camera2 com.android.egg com.android.dreams.basic com.android.musicfx com.google.android.marvin.talkback com.google.android.healthconnect.controller com.android.bips com.google.android.printservice.recommendation com.android.printspooler com.android.bookmarkprovider com.android.providers.partnerbookmarks com.android.htmlviewer com.google.android.tag com.android.traceur com.android.vending com.google.android.googlesdksetup com.google.android.partnersetup com.google.android.onetimeinitializer ;;
+    assistant) echo com.google.android.googlequicksearchbox com.google.android.as com.google.android.as.oss com.google.android.settings.intelligence ;;
+    telephony) echo com.android.stk com.android.cellbroadcastreceiver com.google.android.cellbroadcastreceiver com.google.android.telephony.satellite com.android.carrierdefaultapp com.android.imsserviceentitlement com.android.simappdialog com.android.ons ;;
+    wallpaper) echo com.google.android.apps.wallpaper com.android.wallpaper.livepicker com.android.wallpapercropper com.google.android.apps.customization.pixel ;;
+    telemetry) echo com.google.android.adservices.api com.google.android.federatedcompute com.google.android.ondevicepersonalization.services com.google.android.odad com.android.dynsystem ;;
+    gms) echo com.google.android.gms com.google.android.gsf ;;
+  esac
+}
+
+cmd_slim() {
+  [ ${#POS[@]} -eq 1 ] || usage_die "usage: avdslim slim <name> --golden [--except cat,...] [--with gms] [--off] | --ram MB"
+  local name="${POS[0]}" c cats="" script="" verb=disable-user have new="" on marker n
+  for c in ${WITH//,/ } ${EXCEPT//,/ }; do
+    case " $SLIM_ALL " in *" $c "*) ;; *) usage_die "unknown slim category '$c' (one of: $SLIM_ALL)" ;; esac
+  done
+  for c in $SLIM_ALL; do # canonical order: the default set plus --with, minus --except
+    case " $SLIM_DEFAULT ${WITH//,/ } " in *" $c "*) ;; *) continue ;; esac
+    case " ${EXCEPT//,/ } " in *" $c "*) continue ;; esac
+    cats="$cats $c"
+  done
+  lock_avd "$name"
+  require_avd "$name"
+  [ "$(kind_of "$AVD_DIR")" = golden ] || refuse "'$name' is not a golden AVD; slim only prepares a golden (mark it first: avdslim golden $name)"
+  need_golden_flag "$name" "slimming it"
+  marker="$AVD_DIR/avdslim.golden"
+  if [ -n "$RAM" ]; then
+    [[ $RAM =~ ^[1-9][0-9]{3}$ ]] || usage_die "--ram needs a plain MB value, e.g. 2048"
+    refuse_if_running "$name" "changing its RAM (then: avdslim boot $name --golden --cold, and shutdown to seal)"
+    { grep -v '^hw\.ramSize *=' "$AVD_DIR/config.ini" || :; echo "hw.ramSize=$RAM"; } > "$AVD_DIR/config.ini.new" &&
+      mv "$AVD_DIR/config.ini.new" "$AVD_DIR/config.ini" || die "cannot update $AVD_DIR/config.ini"
+    marker_set "$marker" lowram "$([ "$RAM" -lt 2560 ] && echo 1)"
+    echo "$name: guest RAM $RAM MB$([ "$RAM" -lt 2560 ] && echo ' (-lowram)'); cold boot it with --golden, then seal it"
+    return 0
+  fi
+  find_running "$name" && [ -n "$R_PORT" ] || die "'$name' is not running (avdslim boot $name --golden --cold)"
+  need_adb
+  verify_serial "$name" "emulator-$R_PORT"
+  [ "$OFF" = 0 ] || verb=enable
+  for c in $cats; do
+    if [ "$c" != radios ]; then script="$script for p in $(slim_pkgs "$c"); do pm $verb --user 0 \$p; done;"
+    elif [ "$OFF" = 1 ]; then script="$script svc bluetooth enable; settings delete global ble_scan_always_enabled; settings delete global wifi_scan_always_enabled;"
+    else script="$script svc bluetooth disable; settings put global ble_scan_always_enabled 0; settings put global wifi_scan_always_enabled 0;"
+    fi
+  done
+  "$ADB" -s "emulator-$R_PORT" shell "$script true" >/dev/null 2>&1 || die "slim failed on '$name'; check adb and retry"
+  have="$(ini_get "$marker" slim)"
+  for c in $SLIM_ALL; do
+    case ",$have," in *",$c,"*) on=1 ;; *) on=0 ;; esac
+    case " $cats " in *" $c "*) [ "$OFF" = 1 ] && on=0 || on=1 ;; esac
+    [ "$on" = 0 ] || new="${new:+$new,}$c"
+  done
+  marker_set "$marker" slim "$new"
+  n="$("$ADB" -s "emulator-$R_PORT" shell 'pm list packages -d | wc -l' | tr -d '\r ')"
+  echo "$name: slim=${new:-(none)}, $n packages disabled; shutdown to seal it"
 }
 
 delete_one() {
@@ -634,7 +723,7 @@ main() {
   esac
   case "$cmd" in
     list|ls|status|clone|boot|shutdown|stop|delete|rm) ;;
-    install|golden|serial) [ "$JSON" = 0 ] || usage_die "--json is not supported by $cmd" ;;
+    install|golden|serial|slim) [ "$JSON" = 0 ] || usage_die "--json is not supported by $cmd" ;;
     *) usage_die "unknown command: $cmd" ;;
   esac
   [ -d "$AVD_HOME" ] || die "AVD home not found: $AVD_HOME (create an AVD or set ANDROID_AVD_HOME)"
@@ -648,6 +737,7 @@ main() {
     delete|rm) cmd_delete ;;
     install) cmd_install ;;
     golden) cmd_golden ;;
+    slim) cmd_slim ;;
     *) usage_die "unknown command: $cmd" ;;
   esac
 }
