@@ -14,7 +14,7 @@ mkdir -p "$ANDROID_AVD_HOME" "$TMP/sdk/emulator" "$TMP/sdk/platform-tools" "$FAK
 mkdir "$TMP/bin"
 cat > "$TMP/bin/ps" <<'EOF'
 #!/bin/bash
-/bin/ps "$@" | awk -v exe="$ANDROID_SDK_ROOT/emulator/emulator" 'index($0," " exe " -avd ")'
+/bin/ps "$@" | awk -v exe="$ANDROID_SDK_ROOT/emulator/emulator" 'index($0," " exe " -avd ") { $2="emulator"; print }'
 EOF
 printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/lsof"
 chmod +x "$TMP/bin/"*
@@ -159,6 +159,11 @@ check "clone onto existing name fails" 1 "$AVDSLIM" clone Base SUBS-421-renter
 check "clone of missing source fails" 1 "$AVDSLIM" clone Nope x
 check "clone rejects unusable name" 2 "$AVDSLIM" clone Base "--"
 check "clone of a clone is refused" 3 "$AVDSLIM" clone SUBS-421-renter again
+make_avd Spaced
+sed -i '' 's/^path=/path = /' "$ANDROID_AVD_HOME/Spaced.ini"
+check "clone source with spaced ini assignment" 0 "$AVDSLIM" clone Spaced spaced-clone
+check "spaced assignment is replaced, not shadowing the clone path" 0 "$AVDSLIM" delete spaced-clone
+t "spaced source remains intact" test -f "$ANDROID_AVD_HOME/Spaced.avd/config.ini"
 check "stopped clone cannot be marked golden" 3 "$AVDSLIM" golden SUBS-421-renter
 
 # --- boot: snapshot on first boot, cold afterwards, same flags with and without a window
@@ -251,6 +256,7 @@ check "clone of running AVD is refused" 3 "$AVDSLIM" clone Hand_Made copy
 check "delete running unmanaged refused" 3 "$AVDSLIM" delete Hand_Made
 check "delete --force running unmanaged refused" 3 "$AVDSLIM" delete Hand_Made --force
 check "delete --force --stop running unmanaged refused" 3 "$AVDSLIM" delete Hand_Made --force --stop
+check "an inherited process cache cannot bypass running protection" 3 env PS_SNAP='' "$AVDSLIM" delete Hand_Made --force
 t "running AVD still on disk and alive" eval '[ -d "$ANDROID_AVD_HOME/Hand_Made.avd" ] && "$AVDSLIM" serial Hand_Made >/dev/null'
 check "shutdown the hand-made AVD" 0 "$AVDSLIM" shutdown Hand_Made
 check "delete --force of a stopped unmanaged AVD" 0 "$AVDSLIM" delete Hand_Made --force

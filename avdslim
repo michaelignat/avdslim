@@ -105,20 +105,23 @@ need_golden_flag() { # name what
 
 # ---------------------------------------------------------------- running emulators
 
+emulator_processes() {
+  ps -axww -o pid=,ucomm=,command= | awk '$2 ~ /^(qemu-system|emulator)/'
+}
+
 # find_running name -> sets R_PIDS (space separated) and R_PORT; returns 0 when running.
 find_running() {
-  [ -n "${PS_SNAP+x}" ] || PS_SNAP="$(ps -axo pid=,command=)" || die "cannot inspect running emulators"
+  [ -n "${PS_SNAP+x}" ] || PS_SNAP="$(emulator_processes)" || die "cannot inspect running emulators"
   local out
-  out="$(printf '%s\n' "$PS_SNAP" | awk -v n="$1" '
-    index($0, "qemu-system") || index($0, "/emulator") {
+  out="$(awk -v n="$1" '{
       hit = 0; port = ""
       for (i = 2; i <= NF; i++) {
-        if (($i == "-avd" && $(i + 1) == n) || $i == "@" n) hit = 1
+        if (($i == "-avd" && tolower($(i + 1)) == tolower(n)) || tolower($i) == "@" tolower(n)) hit = 1
         if ($i == "-port") port = $(i + 1)
       }
       if (hit) { pids = pids " " $1; if (port != "") p = port }
     }
-    END { if (pids != "") print p "|" pids }')"
+    END { if (pids != "") print p "|" pids }' <<<"$PS_SNAP")"
   R_PIDS=""; R_PORT=""
   [ -n "$out" ] || return 1
   R_PORT="${out%%|*}"
@@ -160,7 +163,7 @@ pick_port() {
     exec 9>>"$STATE_DIR/locks/port-$p" || die "cannot open port lock"
     try_lock <&9 || continue
     lsof -nP -iTCP:"$p-$((p+1))" -sTCP:LISTEN >/dev/null 2>&1 && continue
-    processes="$(ps -axo command=)" || die "cannot inspect port owners"
+    processes="$(emulator_processes)" || die "cannot inspect port owners"
     [[ " $processes " =~ [[:space:]]-port[[:space:]]+$p([[:space:]]|$) ]] && continue
     PICKED_PORT="$p"; return 0
   done
@@ -229,7 +232,7 @@ cmd_list() {
   [ "$JSON" = 0 ] || printf '['
   for f in "$AVD_HOME"/*.ini; do
     [ -f "$f" ] || continue
-    name="$(basename "$f" .ini)"
+    name="${f##*/}"; name="${name%.ini}"
     dir="$(ini_get "$f" path)"
     [ -n "$dir" ] || dir="$AVD_HOME/$name.avd"
     [ -f "$dir/config.ini" ] || continue
@@ -301,16 +304,17 @@ cmd_status() {
 # first cluster, so a header grep finds the rare absolute path into the source AVD
 # without spawning qemu-img for every file; only those files get rebased.
 fix_backing_files() { # dir srcdir
-  local d="$1" s="$2" qi f b fmt
+  local d="$1" s="$2" qi f info b fmt
   for f in "$d"/*.qcow2; do
     [ -f "$f" ] || continue
     head -c 4096 "$f" | grep -aqF -- "$s/" || continue
     qi="$(find_tool qemu-img emulator)"
-    [ -n "$qi" ] || { warn "qemu-img not found; $(basename "$f") still backs onto the source AVD"; continue; }
-    b="$("$qi" info "$f" 2>/dev/null | sed -n 's/^backing file: //p' | awk '{ print $1 }')"
-    fmt="$("$qi" info "$f" 2>/dev/null | sed -n 's/^backing file format: //p')"
+    [ -n "$qi" ] || die "qemu-img needed to inspect $f; install the SDK emulator tools"
+    info="$("$qi" info "$f")" || die "cannot inspect $f"
+    b="$(sed -n 's/^backing file: //p' <<<"$info")"; b="${b% (actual path:*}"
+    fmt="$(sed -n 's/^backing file format: //p' <<<"$info")"
     case "$b" in
-      "$s"/*) "$qi" rebase -u -f qcow2 ${fmt:+-F "$fmt"} -b "${b#"$s"/}" "$f" || warn "could not rebase $f" ;;
+      "$s"/*) "$qi" rebase -u -f qcow2 ${fmt:+-F "$fmt"} -b "${b#"$s"/}" "$f" || die "cannot detach $f from its source" ;;
     esac
   done
 }
@@ -341,24 +345,24 @@ cmd_clone() {
   pkgs="$(ini_get "$tmp/avdslim.golden" packages)"
   # Drop what belongs to one running instance or to the source's identity.
   (cd "$tmp" && rm -rf ./*.lock hardware-qemu.ini emulator-user.ini bootcompleted.ini emu-launch-params.txt \
-    read-snapshot.txt tmpAdbCmds avdslim.golden avdslim.managed)
+    read-snapshot.txt tmpAdbCmds avdslim.golden avdslim.managed) || die "cannot clean staging directory $tmp"
   fix_backing_files "$tmp" "$src_dir"
-  sed -i '' -E "s/^(avd\.id|avd\.name|AvdId|avd\.ini\.displayname)=.*/\1=$name/" "$tmp/config.ini"
+  sed -i '' -E "s/^(avd\.id|avd\.name|AvdId|avd\.ini\.displayname)=.*/\1=$name/" "$tmp/config.ini" || die "cannot update $tmp/config.ini"
   # A snapshot is only restored when its recorded hardware config matches the AVD's,
   # and that config names the AVD and its image paths. Re-point it at the clone.
   src_re="$(printf '%s' "$src" | sed 's/[.]/\\./g')"
   for h in "$tmp"/snapshots/*/hardware.ini; do
     [ -f "$h" ] || continue
-    sed -i '' -E -e "s#/$src_re\.avd/#/$name.avd/#g" -e "s#^(avd\.(name|id) *= *)$src_re\$#\1$name#" "$h"
+    sed -i '' -E -e "s#/$src_re\.avd/#/$name.avd/#g" -e "s#^(avd\.(name|id) *= *)$src_re\$#\1$name#" "$h" || die "cannot update $h"
   done
-  printf 'source=%s\ncreated=%s\npackages=%s\n' "$src" "$(utc_now)" "$pkgs" > "$tmp/avdslim.managed"
+  printf 'source=%s\ncreated=%s\npackages=%s\n' "$src" "$(utc_now)" "$pkgs" > "$tmp/avdslim.managed" || die "cannot mark staged clone"
   # path.rel is relative to the AVD home's parent; only valid for the standard layout.
   home_parent="$(basename "$AVD_HOME")"
   {
-    grep -v -e '^path=' -e '^path\.rel=' "$src_ini"
-    echo "path=$AVD_HOME/$name.avd"
+    sed -E '/^path(\.rel)? *=/d' "$src_ini" || exit 1
+    echo "path=$AVD_HOME/$name.avd" || exit 1
     [ "$home_parent" != avd ] || echo "path.rel=avd/$name.avd"
-  } > "$AVD_HOME/.$name.ini.avdslim-tmp"
+  } > "$AVD_HOME/.$name.ini.avdslim-tmp" || die "cannot stage registration for '$name'"
   mv "$tmp" "$AVD_HOME/$name.avd" || { rm -rf "$tmp" "$AVD_HOME/.$name.ini.avdslim-tmp"; die "could not move clone into place"; }
   mv "$AVD_HOME/.$name.ini.avdslim-tmp" "$AVD_HOME/$name.ini" || die "could not register '$name'; inspect $AVD_HOME"
   k=$(($(now_ms) - t0))
@@ -602,7 +606,7 @@ delete_one() {
     JSON=0 stop_avd "$name" discard >&2
   fi
   rm -rf -- "$AVD_DIR" || die "could not remove $AVD_DIR"
-  rm -f -- "$AVD_HOME/$name.ini" "$STATE_DIR/logs/$name.log"
+  rm -f -- "$AVD_HOME/$name.ini" "$STATE_DIR/logs/$name.log" || die "cannot finish removing '$name'; inspect $AVD_HOME"
   [ "$JSON" = 1 ] || echo "deleted $name"
 }
 
@@ -648,4 +652,5 @@ main() {
   esac
 }
 
+unset PS_SNAP
 main "$@"
