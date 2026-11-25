@@ -10,13 +10,32 @@ Keep one **golden** emulator with your apps installed. Clone it for each task, t
 
 The Android counterpart of [simslim](https://github.com/mobai-app/simslim).
 
+## Install with an agent
+
+Copy this into your coding agent:
+
+```text
+Install avdslim (https://github.com/michaelignat/avdslim) for me:
+
+1. Download the latest release to ~/.local/bin/avdslim and make it executable:
+   mkdir -p ~/.local/bin && curl -fsSL https://github.com/michaelignat/avdslim/releases/latest/download/avdslim -o ~/.local/bin/avdslim && chmod +x ~/.local/bin/avdslim
+   Make sure ~/.local/bin is on my PATH, then run `avdslim version`.
+2. Save https://raw.githubusercontent.com/michaelignat/avdslim/main/skills/avdslim/SKILL.md as an "avdslim" skill in your skills directory.
+3. Ask me which emulator should be the golden one, or help me make one (see the README's "Make a golden").
+4. Add this to my global AGENTS.md:
+   "Android emulators: use avdslim. Clone the golden per task, pin commands to the serial it prints, and delete your clone when done. Never touch the golden or another task's emulator. Update avdslim by re-running the install curl command."
+```
+
 ## Install
 
 Needs macOS and the Android SDK.
 
 ```sh
-make install    # symlinks avdslim into ~/.local/bin
+mkdir -p ~/.local/bin && curl -fsSL https://github.com/michaelignat/avdslim/releases/latest/download/avdslim \
+  -o ~/.local/bin/avdslim && chmod +x ~/.local/bin/avdslim
 ```
+
+Run the same command again to update. From a clone of this repo: `make install`.
 
 ## Use a clone
 
