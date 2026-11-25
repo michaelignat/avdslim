@@ -1,109 +1,237 @@
 #!/bin/bash
-# shellcheck disable=SC2015  # `A && ok || bad` is the intended idiom here
-# Offline checks for avdslim: no emulator, no adb. Uses a throwaway AVD home.
-# Run: test/test.sh   (needs only bash and macOS tools)
+# shellcheck disable=SC2015,SC2016  # `A && ok || bad` and eval'd single-quoted checks are intended
+# Offline checks for avdslim. Everything runs against a throwaway AVD home with a fake
+# `emulator` and `adb`, so no real emulator or AVD is ever touched.
+# Run: test/test.sh   (needs only bash, python3 and macOS tools)
 set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd -P)"
 AVDSLIM="$HERE/avdslim"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/avdslim-test.XXXXXX")" || exit 1
-trap 'rm -rf "$TMP"' EXIT
-export ANDROID_AVD_HOME="$TMP/avd" AVDSLIM_STATE="$TMP/state" ANDROID_SDK_ROOT="$TMP/sdk"
-mkdir -p "$ANDROID_AVD_HOME" "$TMP/sdk"
+TMP="$(cd "$TMP" && pwd -P)"
+export ANDROID_AVD_HOME="$TMP/avd" AVDSLIM_STATE="$TMP/state" ANDROID_SDK_ROOT="$TMP/sdk" FAKE="$TMP/fake"
+mkdir -p "$ANDROID_AVD_HOME" "$TMP/sdk/emulator" "$TMP/sdk/platform-tools" "$FAKE"
+cleanup() {
+  local f
+  for f in "$FAKE"/pid-*; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+# Fake emulator: records its arguments, pretends to load the snapshot, stays alive.
+cat > "$TMP/sdk/emulator/emulator" <<'EOF'
+#!/bin/bash
+name=""; port=""; load=1; args="$*"
+while [ $# -gt 0 ]; do
+  case "$1" in -avd) name="$2" ;; -port) port="$2" ;; -no-snapshot-load) load=0 ;; esac
+  shift
+done
+echo "$args" > "$FAKE/args-$name"
+echo "$name" > "$FAKE/name-$port"
+: > "$ANDROID_AVD_HOME/$name.avd/hardware-qemu.ini"
+if [ "$load" = 1 ]; then
+  if [ -f "$FAKE/snapshot-broken" ]; then
+    echo "USER_INFO    | The emulator is starting from scratch. Reason: different renderer configured"
+  else
+    echo "INFO         | Successfully loaded snapshot 'default_boot' using 1 ms"
+  fi
+fi
+echo $$ > "$FAKE/pid-$port"
+sleep 300 &
+trap 'kill $!; exit 0' TERM
+wait
+EOF
+# Fake adb: answers only for serials whose fake emulator is alive.
+cat > "$TMP/sdk/platform-tools/adb" <<'EOF'
+#!/bin/bash
+[ "${1:-}" = -s ] || exit 0 # start-server, devices
+port="${2#emulator-}"; shift 2
+kill -0 "$(cat "$FAKE/pid-$port" 2>/dev/null)" 2>/dev/null || { echo "adb: device not found" >&2; exit 1; }
+name="$(cat "$FAKE/name-$port")"
+echo "$name: $*" >> "$FAKE/adb.log"
+case "$*" in
+  "shell getprop sys.boot_completed") echo 1 ;;
+  "shell pm list packages -3") cat "$FAKE/packages" 2>/dev/null ;;
+  "emu avd snapshot save default_boot")
+    mkdir -p "$ANDROID_AVD_HOME/$name.avd/snapshots/default_boot"
+    echo saved > "$ANDROID_AVD_HOME/$name.avd/snapshots/default_boot/snapshot.pb"
+    printf 'hw.gpu.mode = host\navd.name = %s\n' "$name" > "$ANDROID_AVD_HOME/$name.avd/snapshots/default_boot/hardware.ini"
+    echo OK ;;
+  "emu kill") kill "$(cat "$FAKE/pid-$port")"; rm -f "$FAKE/pid-$port" ;;
+  install*) echo Success ;;
+esac
+EOF
+chmod +x "$TMP/sdk/emulator/emulator" "$TMP/sdk/platform-tools/adb"
 
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok   $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL $1"; }
-check() { # description, expected-exit, command...
-  local desc="$1" want="$2" out rc
+check() { # description, expected-exit, command...   (LAST = stdout+stderr, OUT = stdout only)
+  local desc="$1" want="$2" rc
   shift 2
-  out="$("$@" 2>&1)"; rc=$?
-  LAST="$out"
-  if [ "$rc" = "$want" ]; then ok "$desc"; else bad "$desc (exit $rc, wanted $want): $out"; fi
+  OUT="$("$@" 2>"$TMP/stderr")"; rc=$?
+  LAST="$OUT$(cat "$TMP/stderr")"
+  if [ "$rc" = "$want" ]; then ok "$desc"; else bad "$desc (exit $rc, wanted $want): $LAST"; fi
 }
 contains() { case "$LAST" in *"$1"*) ok "output has '$1'" ;; *) bad "output lacks '$1': $LAST" ;; esac; }
+is_json() { printf '%s' "$OUT" | python3 -I -m json.tool >/dev/null 2>&1 && ok "$1 is valid JSON" || bad "$1 is valid JSON: $OUT"; }
+t() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
+args_of() { cat "$FAKE/args-$1"; }
+has_arg() { case " $(args_of "$1") " in *" $2 "*) return 0 ;; esac; return 1; }
 
-# A fake AVD: config, a qcow2-looking overlay, a snapshot, and per-instance junk.
+# A fake AVD the way avdmanager leaves it, plus per-instance junk from an earlier run.
 make_avd() { # name
   local d="$ANDROID_AVD_HOME/$1.avd"
-  mkdir -p "$d/snapshots/default_boot"
+  mkdir -p "$d"
   printf 'avd.id=<build>\navd.name=<build>\nhw.device.name=pixel_8\nhw.ramSize=2G\n' > "$d/config.ini"
   printf 'avd.ini.encoding=UTF-8\npath=%s\npath.rel=avd/%s.avd\ntarget=android-34\n' "$d" "$1" > "$ANDROID_AVD_HOME/$1.ini"
-  printf 'avd.name = %s\ndisk.dataPartition.path = %s/userdata.img\n' "$1" "$d" > "$d/snapshots/default_boot/hardware.ini"
   echo data > "$d/userdata.img"
   : > "$d/multiinstance.lock"; : > "$d/hardware-qemu.ini"; echo uuid=1 > "$d/emulator-user.ini"
 }
+add_snapshot() { # name gpu-mode
+  local d="$ANDROID_AVD_HOME/$1.avd"
+  mkdir -p "$d/snapshots/default_boot"
+  echo old > "$d/snapshots/default_boot/snapshot.pb"
+  printf 'hw.gpu.mode = %s\navd.name = %s\ndisk.dataPartition.path = %s/userdata.img\n' "$2" "$1" "$d" > "$d/snapshots/default_boot/hardware.ini"
+}
+C="$ANDROID_AVD_HOME/SUBS-421-renter.avd"
 
 make_avd Base
 make_avd Hand_Made
-
 check "list shows AVDs" 0 "$AVDSLIM" list; contains "Base"
-check "list --json is a JSON array" 0 "$AVDSLIM" list --json
-case "$LAST" in '['*']') ok "json brackets" ;; *) bad "json brackets: $LAST" ;; esac
+check "list --json" 0 "$AVDSLIM" list --json; is_json "list"
+check "status --json" 0 "$AVDSLIM" status Base --json; is_json "status"
+
+# --- creating a golden: boot the fresh AVD, install, seal it while running
+check "boot a fresh AVD" 0 "$AVDSLIM" boot Base --json; is_json "boot"; contains '"snapshot":"cold"'
+t "fresh AVD boots with the host GPU" has_arg Base "-gpu host"
+t "an unmanaged AVD keeps save-on-exit" eval '! has_arg Base -no-snapshot-save'
+check "boot again is idempotent" 0 "$AVDSLIM" boot Base; [ "$OUT" = emulator-5554 ] && ok "prints only the serial" || bad "prints only the serial: $OUT"
+check "install" 0 "$AVDSLIM" install Base "$0"; contains Success
+echo "package:app.ailo" > "$FAKE/packages"
+check "seal a running AVD as golden" 0 "$AVDSLIM" golden Base; contains "sealed Base as golden with apps: app.ailo"
+t "seal flushed the disk before saving the snapshot" eval 'grep -A3 "^Base: shell sync" "$FAKE/adb.log" | grep -q "snapshot save"'
+t "seal saved a snapshot" grep -q saved "$ANDROID_AVD_HOME/Base.avd/snapshots/default_boot/snapshot.pb"
+t "seal recorded the apps" grep -q '^packages=app.ailo$' "$ANDROID_AVD_HOME/Base.avd/avdslim.golden"
+check "golden is stopped after sealing" 1 "$AVDSLIM" serial Base
+
+# --- golden protection
+check "golden cannot be booted" 3 "$AVDSLIM" boot Base
+check "golden cannot be installed onto" 3 "$AVDSLIM" install Base "$0"
+check "golden cannot be deleted" 3 "$AVDSLIM" delete Base
+check "golden cannot be deleted with --force" 3 "$AVDSLIM" delete Base --force
+check "golden listed as golden" 0 "$AVDSLIM" list; contains "golden"
 
 # --- clone
-check "clone sanitizes spaces" 0 "$AVDSLIM" clone Base "SUBS 421 renter"; contains "SUBS-421-renter"
-[ -d "$ANDROID_AVD_HOME/SUBS-421-renter.avd" ] && ok "clone dir exists" || bad "clone dir exists"
-[ ! -e "$ANDROID_AVD_HOME/SUBS-421-renter.avd/multiinstance.lock" ] && ok "lock dropped" || bad "lock dropped"
-[ ! -e "$ANDROID_AVD_HOME/SUBS-421-renter.avd/hardware-qemu.ini" ] && ok "hardware-qemu.ini dropped" || bad "hardware-qemu.ini dropped"
-[ ! -e "$ANDROID_AVD_HOME/SUBS-421-renter.avd/emulator-user.ini" ] && ok "emulator-user.ini dropped" || bad "emulator-user.ini dropped"
-[ -f "$ANDROID_AVD_HOME/SUBS-421-renter.avd/avdslim.managed" ] && ok "managed marker" || bad "managed marker"
-grep -q '^avd.name=SUBS-421-renter$' "$ANDROID_AVD_HOME/SUBS-421-renter.avd/config.ini" && ok "identity rewritten" || bad "identity rewritten"
-grep -q "SUBS-421-renter.avd/userdata.img" "$ANDROID_AVD_HOME/SUBS-421-renter.avd/snapshots/default_boot/hardware.ini" && ok "snapshot repointed" || bad "snapshot repointed"
-grep -q "^path=$ANDROID_AVD_HOME/SUBS-421-renter.avd\$" "$ANDROID_AVD_HOME/SUBS-421-renter.ini" && ok "ini path" || bad "ini path"
+check "clone sanitizes spaces" 0 "$AVDSLIM" clone Base "SUBS 421 renter" --json; is_json "clone"; contains "SUBS-421-renter"
+t "clone dir exists" test -d "$C"
+t "lock dropped" test ! -e "$C/multiinstance.lock"
+t "hardware-qemu.ini dropped" test ! -e "$C/hardware-qemu.ini"
+t "emulator-user.ini dropped" test ! -e "$C/emulator-user.ini"
+t "clone is not golden" test ! -e "$C/avdslim.golden"
+t "clone inherits the golden's app list" grep -q '^packages=app.ailo$' "$C/avdslim.managed"
+t "identity rewritten" grep -q '^avd.name=SUBS-421-renter$' "$C/config.ini"
+t "snapshot repointed" grep -q '^avd.name = SUBS-421-renter$' "$C/snapshots/default_boot/hardware.ini"
+t "ini path" grep -q "^path=$C\$" "$ANDROID_AVD_HOME/SUBS-421-renter.ini"
+t "ini path.rel" grep -q '^path.rel=avd/SUBS-421-renter.avd$' "$ANDROID_AVD_HOME/SUBS-421-renter.ini"
+t "no temporary files left" eval '[ -z "$(ls -A "$ANDROID_AVD_HOME" | grep avdslim-tmp)" ]'
+check "status of a clone" 0 "$AVDSLIM" status SUBS-421-renter; contains "kind:     clone"
 check "clone onto existing name fails" 1 "$AVDSLIM" clone Base SUBS-421-renter
 check "clone of missing source fails" 1 "$AVDSLIM" clone Nope x
 check "clone rejects unusable name" 2 "$AVDSLIM" clone Base "--"
-check "clone dry-run changes nothing" 0 "$AVDSLIM" clone Base dry --dry-run
-[ ! -e "$ANDROID_AVD_HOME/dry.avd" ] && ok "dry-run created nothing" || bad "dry-run created nothing"
+check "clone of a clone is refused" 3 "$AVDSLIM" clone SUBS-421-renter again
+check "stopped clone cannot be marked golden" 3 "$AVDSLIM" golden SUBS-421-renter
 
-# --- golden
-check "mark golden" 0 "$AVDSLIM" golden Base
-check "golden cannot be deleted" 3 "$AVDSLIM" delete Base
-check "golden cannot be booted" 3 "$AVDSLIM" boot Base
-check "golden cannot be slimmed" 3 "$AVDSLIM" slim Base
-check "golden cannot be renamed" 3 "$AVDSLIM" rename Base Other
-check "clone of golden is not golden" 0 "$AVDSLIM" status SUBS-421-renter; contains "kind:     clone"
-check "golden listed as golden" 0 "$AVDSLIM" list; contains "golden"
-check "slim golden with --golden" 0 "$AVDSLIM" slim Base --golden --ram 3072 --cores 2
-grep -q '^hw.ramSize=3072M$' "$ANDROID_AVD_HOME/Base.avd/config.ini" && ok "ram set" || bad "ram set"
-grep -q '^showDeviceFrame=no$' "$ANDROID_AVD_HOME/Base.avd/config.ini" && ok "frame off" || bad "frame off"
+# --- boot: snapshot on first boot, cold afterwards, same flags with and without a window
+check "first boot of a clone" 0 "$AVDSLIM" boot SUBS-421-renter --json; contains '"snapshot":"loaded"'
+t "clone never saves a snapshot" has_arg SUBS-421-renter -no-snapshot-save
+t "clone boots headless with the host GPU" eval 'has_arg SUBS-421-renter "-gpu host" && has_arg SUBS-421-renter -no-window'
+t "first boot loads the snapshot" eval '! has_arg SUBS-421-renter -no-snapshot-load'
+check "serial" 0 "$AVDSLIM" serial SUBS-421-renter; [ "$OUT" = emulator-5554 ] && ok "serial value" || bad "serial value: $OUT"
+check "running clone cannot be deleted without --stop" 3 "$AVDSLIM" delete SUBS-421-renter
+check "shutdown" 0 "$AVDSLIM" shutdown SUBS-421-renter --json; is_json "shutdown"
+t "shutdown flushed the guest disk" grep -q "^SUBS-421-renter: shell sync" "$FAKE/adb.log"
+t "shutdown of a clone saved no snapshot" eval '! grep -q "^SUBS-421-renter: emu avd snapshot" "$FAKE/adb.log"'
+check "second boot of a clone" 0 "$AVDSLIM" boot SUBS-421-renter --window --json; contains '"snapshot":"cold"'
+t "second boot keeps the clone's data (no snapshot load)" has_arg SUBS-421-renter -no-snapshot-load
+t "window boot uses the same GPU and no -no-window" eval 'has_arg SUBS-421-renter "-gpu host" && ! has_arg SUBS-421-renter -no-window'
+check "delete --stop" 0 "$AVDSLIM" delete SUBS-421-renter --stop --json; is_json "delete"
+t "clone gone" eval '[ ! -e "$C" ] && [ ! -e "$ANDROID_AVD_HOME/SUBS-421-renter.ini" ]'
+
+# --- boot verification
+"$AVDSLIM" clone Base v1 >/dev/null; : > "$FAKE/snapshot-broken"
+check "rejected snapshot is reported" 0 "$AVDSLIM" boot v1 --json; contains '"snapshot":"failed"'; contains "different renderer configured"
+rm "$FAKE/snapshot-broken"; "$AVDSLIM" delete v1 --stop >/dev/null 2>&1
+"$AVDSLIM" clone Base v2 >/dev/null; : > "$FAKE/packages"
+check "missing golden apps fail the boot" 1 "$AVDSLIM" boot v2; contains "missing apps its golden had: app.ailo"
+[ "$OUT" = emulator-5554 ] && ok "serial still printed" || bad "serial still printed: $OUT"
+echo "package:app.ailo" > "$FAKE/packages"; "$AVDSLIM" delete v2 --stop >/dev/null 2>&1
+check "cold boot on request" 0 "$AVDSLIM" clone Base v3; "$AVDSLIM" boot v3 --cold >/dev/null 2>&1
+t "--cold skips the snapshot" has_arg v3 -no-snapshot-load
+"$AVDSLIM" delete v3 --stop >/dev/null 2>&1
+
+# --- a snapshot saved without the host GPU only loads with the emulator's default renderer
+make_avd Legacy; add_snapshot Legacy lavapipe; "$AVDSLIM" golden Legacy >/dev/null
+"$AVDSLIM" clone Legacy l1 >/dev/null
+check "legacy snapshot boots headless" 0 "$AVDSLIM" boot l1
+t "legacy snapshot gets no -gpu flag" eval '! has_arg l1 -gpu'
+"$AVDSLIM" delete l1 --stop >/dev/null 2>&1; "$AVDSLIM" clone Legacy l2 >/dev/null
+check "legacy snapshot with --window warns" 0 "$AVDSLIM" boot l2 --window; contains "re-seal the golden"
+"$AVDSLIM" delete l2 --stop >/dev/null 2>&1
+check "cold golden boot switches to the host GPU" 0 "$AVDSLIM" boot Legacy --golden --cold
+t "cold golden boot uses -gpu host" eval 'has_arg Legacy "-gpu host" && has_arg Legacy -no-snapshot-save'
+check "shutdown seals a golden" 0 "$AVDSLIM" shutdown Legacy; contains "sealed Legacy"
+t "re-sealed snapshot records the host GPU" grep -q 'hw.gpu.mode = host' "$ANDROID_AVD_HOME/Legacy.avd/snapshots/default_boot/hardware.ini"
+
+# --- parallel boots get distinct ports; one AVD cannot be booted twice at once
+"$AVDSLIM" clone Base p1 >/dev/null; "$AVDSLIM" clone Base p2 >/dev/null; "$AVDSLIM" clone Base p3 >/dev/null
+"$AVDSLIM" boot p1 > "$TMP/p1" 2>/dev/null & "$AVDSLIM" boot p2 > "$TMP/p2" 2>/dev/null & "$AVDSLIM" boot p3 > "$TMP/p3" 2>/dev/null &
+wait
+ports="$(cat "$TMP/p1" "$TMP/p2" "$TMP/p3" | sort -u | tr '\n' ' ')"
+[ "$ports" = "emulator-5554 emulator-5556 emulator-5558 " ] && ok "three parallel boots, three ports" || bad "three parallel boots, three ports: $ports"
+t "locks released after boot" eval '[ -z "$(ls "$AVDSLIM_STATE" | grep lock)" ]'
+"$AVDSLIM" delete p1 p2 p3 --stop >/dev/null 2>&1
+mkdir -p "$AVDSLIM_STATE/port-5554.lock"; echo 99999999 > "$AVDSLIM_STATE/port-5554.lock/pid"
+"$AVDSLIM" clone Base p4 >/dev/null
+check "stale port lock is taken over" 0 "$AVDSLIM" boot p4; [ "$OUT" = emulator-5554 ] && ok "stale lock port reused" || bad "stale lock port reused: $OUT"
+"$AVDSLIM" shutdown p4 >/dev/null 2>&1
+mkdir -p "$AVDSLIM_STATE/boot-p4.lock"; echo $$ > "$AVDSLIM_STATE/boot-p4.lock/pid"
+check "boot of an AVD another avdslim is booting fails" 1 "$AVDSLIM" boot p4; contains "being booted by another avdslim"
+rm -rf "$AVDSLIM_STATE/boot-p4.lock"; "$AVDSLIM" delete p4 >/dev/null
 
 # --- delete safety
 check "unmanaged AVD needs --force" 3 "$AVDSLIM" delete Hand_Made
-[ -d "$ANDROID_AVD_HOME/Hand_Made.avd" ] && ok "hand-made AVD untouched" || bad "hand-made AVD untouched"
+t "hand-made AVD untouched" test -d "$ANDROID_AVD_HOME/Hand_Made.avd"
 check "delete rejects path-like name" 2 "$AVDSLIM" delete ../avd/Base
-check "delete clone" 0 "$AVDSLIM" delete SUBS-421-renter
-[ ! -e "$ANDROID_AVD_HOME/SUBS-421-renter.avd" ] && [ ! -e "$ANDROID_AVD_HOME/SUBS-421-renter.ini" ] && ok "clone gone" || bad "clone gone"
-
 # An ini that points outside the AVD home must not be deleted.
 mkdir -p "$TMP/elsewhere.avd"; echo x > "$TMP/elsewhere.avd/config.ini"
 printf 'path=%s/elsewhere.avd\ntarget=android-34\n' "$TMP" > "$ANDROID_AVD_HOME/Outside.ini"
 check "ini pointing outside home is refused" 3 "$AVDSLIM" delete Outside --force
-[ -d "$TMP/elsewhere.avd" ] && ok "outside dir untouched" || bad "outside dir untouched"
+t "outside dir untouched" test -d "$TMP/elsewhere.avd"
+# A symlinked AVD directory must not be followed.
+mkdir -p "$TMP/target.avd"; echo x > "$TMP/target.avd/config.ini"; ln -s "$TMP/target.avd" "$ANDROID_AVD_HOME/Linked.avd"
+printf 'path=%s/Linked.avd\n' "$ANDROID_AVD_HOME" > "$ANDROID_AVD_HOME/Linked.ini"
+check "symlinked AVD dir is refused" 3 "$AVDSLIM" delete Linked --force
+t "symlink target untouched" test -f "$TMP/target.avd/config.ini"
 
 # --- a running AVD that avdslim did not create is untouchable, even with --force
-make_avd Running_One
-printf '#!/bin/bash\nsleep 120\n' > "$TMP/qemu-system-fake"; chmod +x "$TMP/qemu-system-fake"
-"$TMP/qemu-system-fake" -avd Running_One -port 5700 >/dev/null 2>&1 &
-FAKE_PID=$!
-sleep 0.5
-check "list sees the running AVD" 0 "$AVDSLIM" list; contains "emulator-5700"
-check "serial of running AVD" 0 "$AVDSLIM" serial Running_One; contains "emulator-5700"
-check "clone of running AVD is refused" 3 "$AVDSLIM" clone Running_One copy
-check "delete running unmanaged refused" 3 "$AVDSLIM" delete Running_One
-check "delete --force running unmanaged refused" 3 "$AVDSLIM" delete Running_One --force
-check "delete --force --stop running unmanaged refused" 3 "$AVDSLIM" delete Running_One --force --stop
-check "rename running refused" 3 "$AVDSLIM" rename Running_One Other
-check "slim running refused" 3 "$AVDSLIM" slim Running_One
-[ -d "$ANDROID_AVD_HOME/Running_One.avd" ] && ok "running AVD still on disk" || bad "running AVD still on disk"
-pkill -P "$FAKE_PID" 2>/dev/null; kill "$FAKE_PID" 2>/dev/null
+check "boot the hand-made AVD" 0 "$AVDSLIM" boot Hand_Made
+check "list --booted sees it" 0 "$AVDSLIM" list --booted; contains "Hand_Made  running  emulator-5554  avd"
+check "clone of running AVD is refused" 3 "$AVDSLIM" clone Hand_Made copy
+check "delete running unmanaged refused" 3 "$AVDSLIM" delete Hand_Made
+check "delete --force running unmanaged refused" 3 "$AVDSLIM" delete Hand_Made --force
+check "delete --force --stop running unmanaged refused" 3 "$AVDSLIM" delete Hand_Made --force --stop
+t "running AVD still on disk and alive" eval '[ -d "$ANDROID_AVD_HOME/Hand_Made.avd" ] && "$AVDSLIM" serial Hand_Made >/dev/null'
+check "shutdown the hand-made AVD" 0 "$AVDSLIM" shutdown Hand_Made
+check "delete --force of a stopped unmanaged AVD" 0 "$AVDSLIM" delete Hand_Made --force
 
 # --- misc
 check "golden --off" 0 "$AVDSLIM" golden Base --off
-check "delete golden-less managed requires managed" 3 "$AVDSLIM" delete Base
+check "un-goldened AVD is unmanaged again" 3 "$AVDSLIM" delete Base
 check "unknown command" 2 "$AVDSLIM" frobnicate
-check "help is complete" 0 "$AVDSLIM" --help; contains "SAFETY RULES"
+check "unknown option" 2 "$AVDSLIM" list --frobnicate
+check "bad --timeout" 2 "$AVDSLIM" boot Base --timeout soon
+check "help" 0 "$AVDSLIM" --help; contains "SAFETY RULES"
 check "version" 0 "$AVDSLIM" version
 
 echo
