@@ -1,39 +1,71 @@
 # avdslim
 
-Clone a stopped Android emulator for each task. On APFS, clones share disk blocks with the original until they write to them. On other filesystems, `clone` falls back to a full copy.
+Fast, disposable Android emulators for parallel testing.
 
-## Run a task
+Keep one **golden** emulator with your apps installed. Clone it for each task, then delete the clone when you're done.
 
-Install the Android SDK on macOS and run `make install` to symlink the script into `~/.local/bin`. Use `avdslim list` to find the golden and any clones you own. Name each clone `<TASK-ID>-<role>`:
+- Clones take **under a second** and **a few MB** (APFS copy-on-write).
+- A fresh clone boots in **about 5–10 s**.
+- Several clones can run at once, each on its own serial.
+
+The Android counterpart of [simslim](https://github.com/mobai-app/simslim).
+
+## Install
+
+Needs macOS and the Android SDK.
 
 ```sh
-name=SUBS-421-renter
-avdslim clone Ailo_Golden_API34 "$name" || exit 1
-SERIAL=$(avdslim boot "$name") || exit 1
-adb -s "$SERIAL" shell getprop ro.build.version.sdk
-avdslim install "$name" new-build.apk
-avdslim delete "$name" --stop
+make install    # symlinks avdslim into ~/.local/bin
 ```
 
-Reuse your own clone across checks. `boot` prints only the ready serial on success; `serial` retrieves a running emulator's serial without waiting for Android. Use `--window` for a visible emulator. After `shutdown`, a used clone cold boots to preserve its data. Clones never save snapshots.
+## Use a clone
 
-A new clone tries to restore the golden's snapshot. If the emulator rejects it, `boot` reports the cold fallback on stderr. If any recorded app is missing, boot fails. Delete your clone and retry with a fresh one; if it happens again, ask the owner to re-seal the golden.
+```sh
+avdslim clone MyGolden SUBS-421-renter    # name: <TASK-ID>-<role>
+SERIAL=$(avdslim boot SUBS-421-renter)    # add --window to see it
+adb -s "$SERIAL" ...                      # pin every command to the serial
+avdslim install SUBS-421-renter app.apk   # optional: a newer build
+avdslim delete SUBS-421-renter --stop     # when the task is done
+```
 
-## Maintain a golden
+**Good to know**
 
-Start with an AVD created in Android Studio or `avdmanager`. Install the apps you want and seal it **while running**:
+- `shutdown` keeps a clone. Its next boot is cold, so its data survives.
+- If `boot` says apps are missing, delete the clone and clone again.
+- **Signature mismatch?** `INSTALL_FAILED_UPDATE_INCOMPATIBLE` means your build is signed with a different key from the installed one, for example a local debug build over an official one. Uninstall the app on your clone first: `adb -s "$SERIAL" uninstall <package>`. This wipes that app's data on the clone only.
+
+## Make a golden
+
+Create a phone emulator in Android Studio or with `avdmanager`, then:
 
 ```sh
 avdslim boot MyGolden
 avdslim install MyGolden app.apk
-avdslim golden MyGolden
+avdslim golden MyGolden      # seal it: saves the apps and stops it
 ```
 
-Sealing flushes the guest disk, records third-party packages, saves the boot snapshot and stops the emulator. On a stopped AVD, `golden` only marks it. To refresh, `boot MyGolden --golden --cold`, install with `--golden`, then `shutdown MyGolden`. Use this after an emulator upgrade or to replace an old snapshot that only loads headless. Existing clones keep their original data.
+**Refresh it later**
+
+```sh
+avdslim boot MyGolden --golden --cold
+avdslim install MyGolden new.apk --golden
+avdslim shutdown MyGolden    # re-seals
+```
+
+Existing clones keep what they had.
+
+## Safety
+
+- Running emulators can't be cloned or deleted.
+- The golden can't be booted, changed or deleted without `--golden`.
+- `delete` only removes clones that avdslim made.
 
 ## Reference
 
-- `avdslim --help` lists commands. `--json` works with `list`, `status`, `clone`, `boot`, `shutdown` and `delete`. Batch delete returns an array; single delete returns an object.
-- Exit codes: `0` success, `1` failure, `2` usage, `3` safety refusal.
-- Set `ANDROID_SDK_ROOT` or `ANDROID_HOME` for a non-default SDK, `ANDROID_AVD_HOME` for a non-default AVD directory, and `AVDSLIM_STATE` for logs and locks. Use the same state directory across concurrent agents.
-- Run `make check` for shellcheck and the offline fake-emulator tests.
+| | |
+| --- | --- |
+| Help | `avdslim --help` |
+| JSON output | `--json` on `list`, `status`, `clone`, `boot`, `shutdown`, `delete` |
+| Exit codes | `0` ok · `1` failed · `2` usage · `3` refused for safety |
+| Environment | `ANDROID_SDK_ROOT`, `ANDROID_AVD_HOME`, `AVDSLIM_STATE` (logs and locks) |
+| Tests | `make check` |

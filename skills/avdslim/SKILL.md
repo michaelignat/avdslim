@@ -3,13 +3,29 @@ name: avdslim
 description: Clone and boot an isolated Android emulator for a task, pin commands to its serial, and clean it up after testing.
 ---
 
-# Run a task on Android
+# Android emulator for a task
 
-1. Choose `<TASK-ID>-<role>`, e.g. `name=SUBS-421-renter`. Check `avdslim list --json`. Reuse only a clone you know belongs to your task. Otherwise run `avdslim clone Ailo_Golden_API34 "$name"`.
-2. Capture the serial: `SERIAL=$(avdslim boot "$name") || exit 1`. Add `--window` for a visible emulator. If another command holds the lock, wait and retry.
-3. Pin every command: `adb -s "$SERIAL" …` or `agent-device open <package> --serial "$SERIAL" --session "$name"`. Install the task's build with `avdslim install "$name" <apk>`.
-4. Use `avdslim shutdown "$name"` to keep the clone between sessions. Its next boot is cold to preserve installed apps and sign-ins. When finished, run `avdslim delete "$name" --stop`.
+**Golden:** `Ailo_Golden_API34`. Clone it. Never boot, change or delete it.
 
-If a snapshot fails to load, check the reported reason and verify the expected state before testing. If boot reports missing apps, delete your clone and clone again. If it repeats, ask the golden's owner to re-seal it. On timeout, inspect the reported log and retry boot.
+## Steps
 
-Never use `--force`, `--golden`, `adb kill-server` or process-wide kills. Other tasks share the host and adb server. Exit 3 is a safety refusal; do not work around it.
+1. **Clone.** Reuse your task's clone if it exists (`avdslim list`). Otherwise:
+   `avdslim clone Ailo_Golden_API34 <TASK-ID>-<role>`, e.g. `SUBS-421-renter`
+2. **Boot.** `SERIAL=$(avdslim boot <name>) || exit 1`. Add `--window` to see it.
+3. **Use.** Pin everything to the serial: `adb -s "$SERIAL" …`, `agent-device … --serial "$SERIAL"`
+4. **New build?** `avdslim install <name> <apk>`
+5. **Done.** `avdslim delete <name> --stop`. To keep it for later: `avdslim shutdown <name>`
+
+## If something goes wrong
+
+- **Apps missing on boot:** delete your clone and clone again.
+- **`INSTALL_FAILED_UPDATE_INCOMPATIBLE`:** your build is signed with a different key from the installed one, for example a local debug build. Run `adb -s "$SERIAL" uninstall <package>`, then install. This only wipes that app's data on your clone.
+- **Busy lock:** wait and retry.
+
+## Never
+
+- `--force` or `--golden`
+- `adb kill-server`, `pkill` or `killall` on emulators
+- Any command on another task's emulator
+
+Exit code `3` is a safety refusal. Don't work around it.
