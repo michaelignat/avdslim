@@ -5,7 +5,8 @@ Fast, disposable Android emulators for parallel testing.
 Keep one **golden** emulator with your apps installed. Clone it for each task, then delete the clone when you're done.
 
 - Clones take **under a second** and **a few MB** (APFS copy-on-write).
-- A fresh clone boots in **about 5–10 s**.
+- A fresh clone boots in **about 2–5 s**.
+- A slimmed golden uses **about 800 MB less memory** per emulator and runs **58 fewer background packages**. Clones inherit both.
 - Several clones can run at once, each on its own serial.
 
 The Android counterpart of [simslim](https://github.com/mobai-app/simslim).
