@@ -20,6 +20,6 @@ release: check
 	@test "$$(git branch --show-current)" = main || { echo "release from main"; exit 2; }
 	@test -z "$$(git status --porcelain)" || { echo "working tree not clean"; exit 2; }
 	sed -i '' 's/^AVDSLIM_VERSION=".*"/AVDSLIM_VERSION="$(VERSION)"/' avdslim
-	git commit -qam "Release v$(VERSION)"
+	git diff --quiet || git commit -qam "Release v$(VERSION)"
 	git tag v$(VERSION)
 	git push origin main v$(VERSION)
