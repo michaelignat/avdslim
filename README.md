@@ -1,9 +1,9 @@
 # avdslim
 
-Clone, boot and delete Android emulators (AVDs) copy-on-write. The Android counterpart
-of [simslim](https://github.com/mobai-app/simslim): keep one "golden" AVD with your
-apps installed, clone it per task for almost no disk, run several clones in parallel,
-delete them when done.
+Give each task its own Android emulator. Keep one "golden" AVD with your apps
+installed, clone it copy-on-write per task, boot the clone from the golden's
+snapshot in seconds, run several side by side, delete them when done. The Android
+counterpart of [simslim](https://github.com/mobai-app/simslim).
 
 One bash script (3.2 compatible), no dependencies beyond the Android SDK tools and
 macOS builtins. Apple Silicon, APFS.
@@ -12,109 +12,136 @@ macOS builtins. Apple Silicon, APFS.
 
 ```sh
 make install                 # symlinks ./avdslim into ~/.local/bin (PREFIX=... to change)
-# or: ln -s "$PWD/avdslim" ~/.local/bin/avdslim
 ```
 
 It finds the SDK through `ANDROID_SDK_ROOT` / `ANDROID_HOME` (default
 `~/Library/Android/sdk`) and AVDs through `ANDROID_AVD_HOME` (default `~/.android/avd`).
 
-## Quick start
+## Per task
 
 ```sh
-# once: create the golden AVD, install your apps, mark it golden
-avdmanager create avd -n Ailo_Golden_API34 -k 'system-images;android-34;google_apis;arm64-v8a' -d pixel_8
-avdslim golden Ailo_Golden_API34
-avdslim slim Ailo_Golden_API34 --golden
-avdslim boot Ailo_Golden_API34 --golden            # first boot is a cold boot (~90s)
-avdslim install Ailo_Golden_API34 --golden app.apk # several apks = one split-APK app
-avdslim shutdown Ailo_Golden_API34                 # saves the quickboot snapshot
-
-# per task
-avdslim clone Ailo_Golden_API34 SUBS-421-renter    # ~0.3s, ~10 MB
-SERIAL=$(avdslim boot SUBS-421-renter)             # ~5-12s, prints emulator-5554
-adb -s "$SERIAL" install -r new-build.apk
+avdslim clone Ailo_Golden_API34 SUBS-421-renter    # 0.1-0.4s, a few MB
+SERIAL=$(avdslim boot SUBS-421-renter)             # 2-7s, prints emulator-5554
+adb -s "$SERIAL" install -r new-build.apk          # or: avdslim install SUBS-421-renter new-build.apk
 avdslim delete SUBS-421-renter --stop
 ```
 
-## Commands
-
-Run `avdslim --help` for the full reference. Summary:
+Name clones `<TASK-ID>-<role>`. `avdslim --help` is the full reference.
 
 | Command | What it does |
 | --- | --- |
-| `list [--booted] [--json]` | name, state, serial, kind (`golden`/`clone`/`avd`), target, device |
-| `status <name> [--json]` | state, serial, pid, source, size, config |
-| `clone <src> <name>` | copy-on-write clone of a stopped AVD; prints the sanitized name |
-| `boot <name> [--window] [--cold] [--port N] [--timeout S] [--no-animations]` | boot detached, wait for `sys.boot_completed`, print the serial |
+| `clone <golden> <name>` | copy-on-write clone of a stopped AVD; prints the final name |
+| `boot <name> [--window] [--cold] [--timeout S] [--no-animations]` | boot detached, wait for Android, print the serial, verify the result |
 | `serial <name>` | serial of a running AVD (exit 1 if stopped) |
-| `shutdown <name>` | `adb emu kill` and wait for exit |
+| `install <name> <apk>...` | `adb install -r`; several apks are one split-APK app |
+| `shutdown <name>` | flush the guest's disk, then stop the emulator |
 | `delete <name>... [--stop] [--force]` | delete clones |
-| `rename <old> <new>` | rename a stopped AVD |
-| `install <name> <apk>...` | `adb install -r` onto the AVD's serial |
-| `golden <name> [--off]` | mark or unmark a golden AVD |
-| `slim <name> [--ram MB] [--cores N]` | audio off, no device frame, optional RAM/cores |
+| `list [--booted]`, `status <name>` | name, state, serial, kind (`golden`/`clone`/`avd`), details |
+| `golden <name> [--off]` | seal a running AVD as golden, or remove the mark |
 
-Global: `--json`, `-n/--dry-run`, `-h/--help`. Results go to stdout (`boot` prints
-only the serial), progress and warnings to stderr. Exit codes: 0 ok, 1 failure,
-2 usage, 3 refused by a safety rule.
+`--json` works on list, status, clone, boot, shutdown and delete. Results go to
+stdout, progress and warnings to stderr. Exit codes: 0 ok, 1 failure, 2 usage,
+3 refused by a safety rule.
+
+## What boot guarantees
+
+- **First boot of a clone** restores the golden's snapshot: Android is up in
+  seconds, exactly as the golden was sealed.
+- **Later boots of the same clone are cold boots** (20-45s). Restoring a snapshot
+  also rolls the disk back to the snapshot, so a second warm boot would silently
+  discard everything the clone installed. `shutdown` flushes the guest's disk
+  first, so the cold boot sees all of it.
+- **`--window` and headless share one snapshot.** The emulator refuses a snapshot
+  saved with a different renderer, and its default renderer is software when
+  headless and the host GPU with a window. `boot` always passes `-gpu host`.
+- **The outcome is checked.** `boot` reports `snapshot loaded`, `cold` or
+  `failed` (a snapshot existed, the emulator rejected it and cold booted; the
+  emulator's reason is printed as a warning). It then compares the installed
+  third-party apps with the list recorded when the golden was sealed and exits 1
+  if any are missing.
+
+## Creating and refreshing a golden
+
+```sh
+# create (once)
+avdmanager create avd -n Ailo_Golden_API34 -k 'system-images;android-34;google_apis;arm64-v8a' -d pixel_8
+avdslim boot Ailo_Golden_API34                 # first boot is cold, about a minute
+avdslim install Ailo_Golden_API34 app.apk
+avdslim golden Ailo_Golden_API34               # seal: flush disk, save snapshot, record apps, stop
+
+# refresh (new build of the app, new sign-in state, ...)
+avdslim boot Ailo_Golden_API34 --golden        # add --cold after an emulator upgrade or a snapshot warning
+avdslim install Ailo_Golden_API34 new.apk --golden
+avdslim shutdown Ailo_Golden_API34             # shutting a golden down always seals it
+```
+
+Sealing matters. The emulator is stopped with `adb emu kill`, which does not shut
+Android down, so whatever Android still holds in its page cache never reaches the
+disk image. A snapshot hides that, because the cache is part of the saved RAM, until
+the first cold boot: an app installed just before the kill is then simply gone.
+Sealing runs `sync` in the guest, saves the snapshot explicitly and records
+`pm list packages -3` in the golden so every clone's boot can be checked against it.
+
+Clones made before a refresh keep the state they were cloned with.
 
 ## How cloning works
 
-`clone` runs `cp -c -R` (APFS `clonefile`) on the AVD directory into a temporary
-directory, then:
+`clone` runs `cp -c -R` (APFS `clonefile`) into a temporary directory, then:
 
 - deletes per-instance state: `*.lock`, `hardware-qemu.ini`, `emulator-user.ini`
   (window position, UUID, Bluetooth address), `bootcompleted.ini`, launch-param files;
-- rewrites the identity in `config.ini` (`avd.id`, `avd.name`, `AvdId`,
-  `avd.ini.displayname` where present) and writes `<name>.ini`;
-- re-points `snapshots/*/hardware.ini` at the clone. The emulator only restores a
-  quickboot snapshot when the recorded AVD name and image paths match, and
-  otherwise falls back to a cold boot ("different AVD configuration");
+- rewrites the identity in `config.ini` and writes `<name>.ini`;
+- re-points `snapshots/*/hardware.ini` at the clone, because the emulator only
+  restores a snapshot whose recorded AVD name and image paths match;
 - rebases any qcow2 overlay whose backing file is an absolute path into the source
   (current emulators use relative names, so this is normally a no-op);
-- marks the clone `avdslim.managed`, then moves it into place.
+- writes `avdslim.managed` (source, creation time, the golden's app list) and moves
+  the clone into place.
 
-Booting passes `-no-window -no-audio -no-boot-anim -no-metrics`, plus
-`-no-snapshot-save` for everything except a golden AVD. A clone therefore restores the
-golden's quickboot snapshot (apps installed, home screen) in seconds and never writes
-a snapshot back. `--cold` forces a full boot. Console ports are the first free even
-port in 5554-5584, claimed under a lock so parallel `boot` calls never collide.
+Clones boot with `-no-snapshot-save`, so they never write the 2.5 GB RAM image a
+snapshot needs. Console ports are the first free even port in 5554-5682; `boot`
+holds a lock on the port and on the AVD name until Android is up, so parallel boots
+never collide and one AVD is never started twice.
 
-### Limits
+## Limits
 
-- Only stopped AVDs can be cloned; a live copy would be inconsistent.
+- Only stopped AVDs can be cloned, and a clone cannot be cloned (its disk no longer
+  matches the snapshot it carries). Clone the golden.
 - Copy-on-write needs APFS. Elsewhere `clone` warns and falls back to a full copy.
-- A clone's blocks diverge from the golden as it runs (userdata is a qcow2 overlay,
-  so the cost is just what the clone writes). `status` reports allocated size
-  including blocks shared with the source, so it overstates the real cost.
-- Quickboot snapshots restore the guest as it was when the golden was shut down.
-  Refresh the golden (boot with `--golden`, change, `shutdown`) to update both
-  disk and snapshot together. Use `--cold` if a task needs a fresh boot.
-- Snapshots are tied to the emulator version and the config; after upgrading the
-  emulator or running `slim --ram/--cores`, refresh the golden.
-- `slim` is deliberately modest: it leaves camera, sensors, GPS and network alone,
-  and does not turn animations off unless you pass `--no-animations` to `boot`.
+- A clone's disk grows by what it writes. `status` reports allocated size including
+  blocks still shared with the golden, so it overstates the real cost.
+- Snapshots are tied to the emulator version. After upgrading the emulator, refresh
+  the golden with `boot --golden --cold`.
+- A golden whose snapshot was saved without `-gpu host` (avdslim 0.1) still boots
+  headless from its snapshot, but `--window` cannot restore it; `boot` warns.
+  Refresh it with `boot --golden --cold`.
+- An AVD avdslim did not create (`avd` in `list`) is booted the way the stock
+  emulator would: it loads and saves its own snapshot.
 
 ## Safety rules
 
-- A running AVD is never cloned, renamed, slimmed or deleted. `--force` does not change that.
-- A golden AVD needs `--golden` to be booted, deleted, renamed, slimmed or installed onto.
-- `delete` only removes AVDs created by `avdslim clone` unless `--force` is given,
-  and only a real directory named `<name>.avd` directly inside the AVD home.
+- A running AVD is never cloned or deleted, except `delete --stop` on a clone.
+- A golden AVD needs `--golden` to be booted, installed onto or deleted.
+- `delete` only removes clones unless `--force` is given, never a running AVD that
+  avdslim did not create, and only a real directory named `<name>.avd` directly
+  inside the AVD home.
 - AVD names are limited to `[A-Za-z0-9._-]`; spaces become `-`, other characters `_`.
 
-## Measured (M-series Mac, APFS, API 34 google_apis arm64, 2 GB RAM, 3.5 GB golden)
+## Measured
+
+M4 Max, APFS, emulator 37.2.12, API 34 google_apis arm64, 2 GB RAM, 3.5 GB golden
+with one 260 MB debug app.
 
 | Operation | Result |
 | --- | --- |
-| Clone time | 0.2-0.3 s |
-| Clone disk cost | about 9-12 MB (`df` before/after; the disk is noisy, so this is an upper estimate) |
-| Boot from the golden snapshot | 11.8 s for the first, 4.4 s and 4.6 s for two booted in parallel |
-| Cold boot of a clone | about 50 s (snapshot unavailable); first boot of the fresh golden was 92 s |
-| Shutdown | 1.6 s for a clone, 4.9 s for the golden (it saves its snapshot) |
+| Clone | 0.1-0.4 s, about 5 MB each (`df` before/after three clones) |
+| First boot of a clone (snapshot) | 2.0-6.7 s alone, 8-9 s for three booted at once; same with `--window` |
+| Cold boot of a clone | 20-45 s |
+| First boot of a new AVD | 58 s |
+| Shutdown | 0.7-2.4 s for a clone, 4.6-13 s for a golden (it saves its snapshot) |
 
 ## Development
 
 ```sh
-make check    # shellcheck + test/test.sh (offline: fake AVD home, no emulator needed)
+make check    # shellcheck + test/test.sh (offline: fake AVD home, fake emulator and adb)
 ```
